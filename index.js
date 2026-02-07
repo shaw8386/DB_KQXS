@@ -2,19 +2,6 @@ import pg from "pg";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-// ====================== IMPORTS ======================
-import express from "express";
-import fetch from "node-fetch";
-import cors from "cors";
-import path from "path";
-import { fileURLToPath } from "url";
-import * as db from "./db/index.js";
-
-process.env.TZ = "Asia/Ho_Chi_Minh";
-
-const app = express();
-app.use(cors());
-app.use(express.json());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -151,11 +138,3 @@ export async function getDrawWithResults(drawDate, provinceCode, regionCode) {
 }
 
 export { pool };
-
-// ====================== START ======================
-const PORT = process.env.PORT || 3000;
-const start = async () => {
-  await db.initDb();
-  app.listen(PORT, () => console.log("🚀 Server chạy port", PORT));
-};
-start();
