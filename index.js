@@ -17,6 +17,7 @@ app.use((req, res, next) => {
   // Cho phép health check, lottery DB read, lottery import (public - proxy bên ngoài có thể yêu cầu token riêng)
   if (req.path === "/health") return next();
   if (req.path.startsWith("/api/lottery/db/")) return next();
+  if (req.path === "/api/lottery/sync-test") return next();
   if (req.path === "/api/lottery/import" && req.method === "POST") return next();
 
   const key = req.headers["x-gi8-key"];
@@ -141,6 +142,18 @@ app.post("/api/lottery/import", async (req, res) => {
   } catch (err) {
     console.error("Import error:", err);
     return res.status(500).json({ error: "Import failed", message: err.message });
+  }
+});
+
+// GET /api/lottery/sync-test?region=mn|mt|mb - Test link phụ xoso188 (không cần key)
+app.get("/api/lottery/sync-test", async (req, res) => {
+  try {
+    const { runSyncTest } = await import("./db/lotterySync.js");
+    const region = (req.query.region || "").toLowerCase();
+    const result = await runSyncTest(region);
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
