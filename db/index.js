@@ -138,4 +138,5 @@ export async function getDrawWithResults(drawDate, provinceCode, regionCode) {
 }
 
 export { pool };
+
 export { scheduleLotterySync } from "./lotterySync.js";
