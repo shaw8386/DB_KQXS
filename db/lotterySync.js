@@ -299,6 +299,34 @@ async function pollUntilResult(region, pool, importLotteryResults) {
 }
 
 /**
+ * Test link phụ xoso188: gọi đúng fetchXoso188ForRegion (header chuẩn).
+ * @param {string} region - 'mn' | 'mt' | 'mb'
+ * @returns {Promise<{ ok: boolean, drawsCount?: number, region?: string, drawDate?: string, sample?: object, error?: string }>}
+ */
+export async function runSyncTest(region) {
+  const valid = { mn: 1, mt: 1, mb: 1 };
+  if (!valid[region]) {
+    return { ok: false, error: "region phải là mn | mt | mb" };
+  }
+  try {
+    const today = getTodayDrawDate();
+    const draws = await fetchXoso188ForRegion(region, null);
+    const forToday = draws.filter((d) => d.draw_date === today);
+    const sample = draws[0] ? { draw_date: draws[0].draw_date, province_code: draws[0].province_code, resultsCount: draws[0].results?.length } : null;
+    return {
+      ok: true,
+      drawsCount: draws.length,
+      forTodayCount: forToday.length,
+      region,
+      drawDate: today,
+      sample,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+}
+
+/**
  * Đăng ký cron: 16:13 MN, 17:13 MT, 18:13 MB (giờ VN, TZ đã set Asia/Ho_Chi_Minh).
  * @param {object} pool - pg.Pool
  * @param {Function} importLotteryResults - (payload) => Promise<{ imported, skipped }>
