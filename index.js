@@ -5,6 +5,7 @@ import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as db from "./db/index.js";
+import { XOSO188_HEADERS, pingXoso188 } from "./db/lotterySync.js";
 
 process.env.TZ = "Asia/Ho_Chi_Minh";
 
@@ -18,6 +19,7 @@ app.use((req, res, next) => {
   if (req.path === "/health") return next();
   if (req.path.startsWith("/api/lottery/db/")) return next();
   if (req.path === "/api/lottery/sync-test") return next();
+  if (req.path === "/api/lottery/ping-xoso188") return next();
   if (req.path === "/api/lottery/import" && req.method === "POST") return next();
 
   const key = req.headers["x-gi8-key"];
@@ -78,15 +80,13 @@ app.use("/api", async (req, res, next) => {
       console.warn("DB fallback error:", e.message);
     }
   }
-  // Proxy to xoso188
+  // Proxy to xoso188 (header chuẩn giống Python để không bị chặn)
   const targetUrl = TARGET_BASE + req.originalUrl;
   try {
     const response = await fetch(targetUrl, {
       method: req.method,
-      headers: {
-        Accept: req.headers.accept || "application/json",
-        "User-Agent": "gi8-proxy",
-      },
+      headers: { ...XOSO188_HEADERS, Accept: req.headers.accept || "application/json" },
+      timeout: 20000,
     });
     const body = await response.text();
     res.status(response.status);
@@ -102,7 +102,8 @@ app.use("/api", async (req, res, next) => {
 app.get("/health", (_, res) => res.send("✅ Railway Lottery Proxy Running"));
 
 // ====================== LOTTERY FETCH (proxy xoso188) ======================
-// GET /api/lottery/fetch?gameCode=xxx&limit=200 - Fetch từ xoso188 qua backend (tránh block từ IP local)
+// Header chuẩn giống tools/fetch_lottery_and_upload.py để xoso188 không chặn
+// GET /api/lottery/fetch?gameCode=xxx&limit=200 - Fetch từ xoso188 qua backend
 app.get("/api/lottery/fetch", async (req, res) => {
   const gameCode = req.query.gameCode;
   const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 500);
@@ -112,10 +113,8 @@ app.get("/api/lottery/fetch", async (req, res) => {
   const targetUrl = `https://xoso188.net/api/front/open/lottery/history/list/game?limitNum=${limit}&gameCode=${gameCode}`;
   try {
     const response = await fetch(targetUrl, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      },
+      headers: { ...XOSO188_HEADERS, Accept: "application/json" },
+      timeout: 20000,
     });
     const body = await response.text();
     res.status(response.status);
@@ -123,6 +122,22 @@ app.get("/api/lottery/fetch", async (req, res) => {
     return res.send(body);
   } catch (err) {
     return res.status(500).json({ error: "Fetch failed", message: err.message });
+  }
+});
+
+// GET /api/lottery/ping-xoso188 - Test Railway có gọi được link phụ xoso188 không (không cần key)
+app.get("/api/lottery/ping-xoso188", async (req, res) => {
+  try {
+    const result = await pingXoso188();
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      status: 0,
+      message: err?.message || String(err),
+      count: 0,
+      source: "xoso188",
+    });
   }
 });
 
@@ -231,8 +246,10 @@ app.listen(PORT, () => {
   console.log("🚀 Server chạy port", PORT);
   db
     .initDb()
-    .then((pool) => {
+    .then(async (pool) => {
       if (pool) db.scheduleLotterySync(pool, db.importLotteryResults);
+      const ping = await pingXoso188();
+      console.log("[Startup] xoso188:", ping.ok ? "OK (count=" + ping.count + ")" : "FAIL", ping.message || "");
     })
     .catch((e) => console.warn("DB init:", e.message));
 });
