@@ -40,44 +40,93 @@ const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, "public")));
 
 // ====================== PROXY: /api/* -> DB hoặc https://xoso188.net/api/* ======================
-// Ưu tiên trả từ DB nếu có /api/front/open/lottery/history/list/game?gameCode=xxx
-// Còn lại proxy sang xoso188.net
+// API đích: GET /api/front/open/lottery/history/list/game?limitNum=200&gameCode=xxx
+// Trả từ DB với format chuẩn { success, msg, code, t: { turnNum, openTime, serverTime, name, code, sort, navCate, issueList } }
 const TARGET_BASE = "https://xoso188.net";
+
+function formatDrawDate(d) {
+  const day = String(d.getDate()).padStart(2, "0");
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const year = d.getFullYear();
+  return { turnNum: `${day}/${month}/${year}`, ymd: `${year}-${month}-${day}` };
+}
 
 app.use("/api", async (req, res, next) => {
   const match = req.path.match(/^\/front\/open\/lottery\/history\/list\/game/);
   if (match && req.method === "GET" && req.query.gameCode && db.pool) {
     try {
-      const limit = Math.min(parseInt(req.query.limitNum || "200", 10) || 200, 500);
-      const { rows } = await db.pool.query(
-        `SELECT d.draw_date, d.id as draw_id, p.api_game_code
-         FROM lottery_draws d
-         JOIN lottery_provinces p ON d.province_id = p.id
-         WHERE p.api_game_code = $1
-         ORDER BY d.draw_date DESC
-         LIMIT $2`,
-        [req.query.gameCode, limit]
+      const data = await db.getLotteryHistoryListGame(
+        req.query.gameCode,
+        req.query.limitNum || "200"
       );
-      if (rows.length > 0) {
-        const issueList = [];
-        for (const row of rows) {
-          const resRows = await db.getResultsByDrawId(row.draw_id);
-          const groups = ["", "", "", "", "", "", "", "", ""];
-          const prizeMap = { DB: 0, G1: 1, G2: 2, G3: 3, G4: 4, G5: 5, G6: 6, G7: 7, G8: 8 };
-          for (const r of resRows) {
-            const idx = prizeMap[r.prize_code];
-            if (idx !== undefined) {
-              groups[idx] = groups[idx] ? groups[idx] + "," + r.result_number : r.result_number;
-            }
-          }
-          const d = row.draw_date;
-          const turnNum = `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-          issueList.push({ turnNum, detail: JSON.stringify(groups) });
-        }
-        return res.json({ t: { issueList } });
+      if (!data) {
+        return res.status(400).json({
+          success: false,
+          msg: "gameCode không tồn tại",
+          code: 400,
+        });
       }
+      const now = new Date();
+      const serverTime =
+        `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ` +
+        `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+
+      const issueList = [];
+      for (const draw of data.draws) {
+        const groups = ["", "", "", "", "", "", "", "", ""];
+        const prizeMap = { DB: 0, G1: 1, G2: 2, G3: 3, G4: 4, G5: 5, G6: 6, G7: 7, G8: 8 };
+        for (const r of draw.results) {
+          const idx = prizeMap[r.prize_code];
+          if (idx !== undefined) {
+            groups[idx] = groups[idx] ? groups[idx] + "," + r.result_number : r.result_number;
+          }
+        }
+        const { turnNum, ymd } = formatDrawDate(draw.draw_date);
+        const openTime = `${ymd} ${data.openTimeByRegion}`;
+        const openTimeStamp = new Date(openTime).getTime();
+        const openNum = groups[0] || ""; // giải đặc biệt
+        issueList.push({
+          turnNum,
+          openNum,
+          openTime,
+          openTimeStamp,
+          detail: JSON.stringify(groups),
+          status: 2,
+          replayUrl: null,
+          n11: null,
+          jackpot: 0,
+        });
+      }
+
+      const latestTurn = data.draws.length
+        ? formatDrawDate(data.draws[0].draw_date)
+        : { turnNum: "", ymd: "" };
+      const t = {
+        turnNum: latestTurn.turnNum,
+        openTime: data.draws.length
+          ? `${latestTurn.ymd} ${data.openTimeByRegion}`
+          : "",
+        serverTime,
+        name: data.name,
+        code: data.code,
+        sort: data.sort,
+        navCate: data.navCate,
+        issueList,
+      };
+
+      return res.json({
+        success: true,
+        msg: "ok",
+        code: 0,
+        t,
+      });
     } catch (e) {
-      console.warn("DB fallback error:", e.message);
+      console.warn("DB history/list/game error:", e.message);
+      return res.status(500).json({
+        success: false,
+        msg: e.message || "Lỗi server",
+        code: 500,
+      });
     }
   }
   // Proxy to xoso188 (header chuẩn giống Python để không bị chặn)
