@@ -235,6 +235,30 @@ async function fetchXoso188Game(gameCode, limitNum = 10) {
   }
 }
 
+/** Test từ server có gọi được xoso188 không. Trả về { ok, status, message, count }. */
+export async function pingXoso188() {
+  try {
+    const issues = await fetchXoso188Game("miba", 2);
+    return {
+      ok: true,
+      status: 200,
+      message: "OK",
+      count: issues.length,
+      source: "xoso188",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      message: err?.message || String(err),
+      count: 0,
+      source: "xoso188",
+    };
+  }
+}
+
+export { XOSO188_HEADERS };
+
 async function fetchXoso188ForRegion(region, filterDrawDate) {
   const gameCodes = REGION_GAME_CODES[region];
   if (!gameCodes) return [];
