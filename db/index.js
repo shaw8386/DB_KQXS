@@ -137,6 +137,79 @@ export async function getDrawWithResults(drawDate, provinceCode, regionCode) {
   return { draw_id: rows[0].id, results };
 }
 
+/** Giờ mở thưởng theo miền (HH:MM) */
+const REGION_OPEN_TIME = { MB: "18:15:00", MT: "17:15:00", MN: "16:15:00" };
+/** sort theo miền (giống frontend) */
+const REGION_SORT = { MB: 10, MT: 20, MN: 30 };
+
+/**
+ * Lấy dữ liệu cho API /api/front/open/lottery/history/list/game
+ * @returns {Promise<{ name, code, sort, navCate, openTimeByRegion, draws: [{ draw_date, draw_id, results }] } | null>}
+ */
+export async function getLotteryHistoryListGame(gameCode, limitNum) {
+  if (!pool) return null;
+  const limit = Math.min(parseInt(limitNum, 10) || 200, 500);
+  const { rows: metaRows } = await pool.query(
+    `SELECT p.name, p.api_game_code, p.id as province_id, r.code as region_code
+     FROM lottery_provinces p
+     JOIN regions r ON p.region_id = r.id
+     WHERE p.api_game_code = $1
+     LIMIT 1`,
+    [gameCode]
+  );
+  if (!metaRows.length) return null;
+
+  const meta = metaRows[0];
+  const { rows: drawRows } = await pool.query(
+    `SELECT d.id as draw_id, d.draw_date
+     FROM lottery_draws d
+     JOIN lottery_provinces p ON d.province_id = p.id
+     WHERE p.api_game_code = $1
+     ORDER BY d.draw_date DESC
+     LIMIT $2`,
+    [gameCode, limit]
+  );
+  if (!drawRows.length) {
+    return {
+      name: meta.name,
+      code: meta.api_game_code,
+      sort: REGION_SORT[meta.region_code] || 0,
+      navCate: meta.region_code.toLowerCase(),
+      openTimeByRegion: REGION_OPEN_TIME[meta.region_code] || "17:15:00",
+      draws: [],
+    };
+  }
+
+  const drawIds = drawRows.map((r) => r.draw_id);
+  const { rows: resultRows } = await pool.query(
+    `SELECT draw_id, prize_code, prize_order, result_number
+     FROM lottery_results
+     WHERE draw_id = ANY($1::int[])
+     ORDER BY draw_id, prize_code, prize_order`,
+    [drawIds]
+  );
+  const byDrawId = {};
+  for (const r of resultRows) {
+    if (!byDrawId[r.draw_id]) byDrawId[r.draw_id] = [];
+    byDrawId[r.draw_id].push(r);
+  }
+
+  const draws = drawRows.map((row) => ({
+    draw_date: row.draw_date,
+    draw_id: row.draw_id,
+    results: byDrawId[row.draw_id] || [],
+  }));
+
+  return {
+    name: meta.name,
+    code: meta.api_game_code,
+    sort: REGION_SORT[meta.region_code] || 0,
+    navCate: meta.region_code.toLowerCase(),
+    openTimeByRegion: REGION_OPEN_TIME[meta.region_code] || "17:15:00",
+    draws,
+  };
+}
+
 export { pool };
 
 export { scheduleLotterySync } from "./lotterySync.js";
