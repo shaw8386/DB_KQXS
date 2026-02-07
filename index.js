@@ -216,5 +216,10 @@ app.get("/api/lottery/db/history/:gameCode", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("🚀 Server chạy port", PORT);
-  db.initDb().catch((e) => console.warn("DB init:", e.message));
+  db
+    .initDb()
+    .then((pool) => {
+      if (pool) db.scheduleLotterySync(pool, db.importLotteryResults);
+    })
+    .catch((e) => console.warn("DB init:", e.message));
 });
