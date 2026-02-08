@@ -15,12 +15,13 @@ app.use(express.json({ limit: "10mb" }));
 
 // ====================== 🔐 GI8 INTERNAL KEY GUARD ======================
 app.use((req, res, next) => {
-  // Cho phép health check, lottery DB read, lottery import (public - proxy bên ngoài có thể yêu cầu token riêng)
-  if (req.path === "/health") return next();
-  if (req.path.startsWith("/api/lottery/db/")) return next();
-  if (req.path === "/api/lottery/sync-test") return next();
-  if (req.path === "/api/lottery/ping-xoso188") return next();
-  if (req.path === "/api/lottery/import" && req.method === "POST") return next();
+  const pathNorm = req.path.replace(/\/$/, "") || "/";
+  // Cho phép health check, lottery DB read, lottery import (GitHub Actions / script gửi POST + x-gi8-key)
+  if (pathNorm === "/health") return next();
+  if (pathNorm.startsWith("/api/lottery/db/")) return next();
+  if (pathNorm === "/api/lottery/sync-test") return next();
+  if (pathNorm === "/api/lottery/ping-xoso188") return next();
+  if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
 
   const key = req.headers["x-gi8-key"];
 
