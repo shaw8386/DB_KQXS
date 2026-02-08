@@ -157,6 +157,16 @@ function getTodayDrawDate() {
   return `${y}-${m}-${d}`;
 }
 
+/** Trả về ngày (YYYY-MM-DD) lùi `daysBack` ngày so với hôm nay (theo giờ VN nếu TZ đã set). */
+function getDrawDateOffset(daysBack) {
+  const now = new Date();
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function parseDetail(detailStr) {
   const results = [];
   let groups = [];
@@ -343,42 +353,55 @@ async function fetchXoso188ForRegion(region, filterDrawDate) {
 let pollIntervals = { mn: null, mt: null, mb: null };
 
 /**
- * 20h cuối ngày (giờ VN): kiểm tra bảng lottery_draws đã có data của ngày hôm nay chưa.
- * Nếu chưa → gọi API xoso188 lấy toàn bộ 3 miền (MN, MT, MB) cho ngày đó → lưu DB.
- * Nếu đã có → bỏ qua.
+ * 20h cuối ngày (và khi startup): kiểm tra 5 ngày theo giờ VN.
+ * - Trước 16:00 VN (chưa xổ ngày hôm nay) → bỏ qua hôm nay, check 5 ngày trước: D-1 .. D-5.
+ * - Từ 16:00 trở đi → check hôm nay + 4 ngày trước: D .. D-4.
+ * Với mỗi ngày chưa có trong lottery_draws → gọi xoso188 lấy MN, MT, MB và lưu DB.
  * @param {object} pool - pg.Pool
  * @param {Function} importLotteryResults - (payload) => Promise<{ imported, skipped }>
  */
 async function checkAndBackfillToday(pool, importLotteryResults) {
   if (!pool || !importLotteryResults) return;
+  const now = new Date();
+  const hourVN = now.getHours();
   const today = getTodayDrawDate();
-  console.log("[LotterySync] 20h check: bắt đầu kiểm tra draw_date=" + today);
+  const includeToday = hourVN >= 16;
+  const datesToCheck = includeToday
+    ? [0, 1, 2, 3, 4].map((d) => getDrawDateOffset(d))
+    : [1, 2, 3, 4, 5].map((d) => getDrawDateOffset(d));
+  console.log(
+    "[LotterySync] 20h check: giờ VN",
+    hourVN + ":xx, includeToday=" + includeToday,
+    "→ kiểm tra",
+    datesToCheck.join(", ")
+  );
   try {
-    const { rows } = await pool.query(
-      "SELECT COUNT(*) AS c FROM lottery_draws WHERE draw_date = $1::date",
-      [today]
-    );
-    const count = parseInt(rows[0]?.c ?? 0, 10);
-    console.log("[LotterySync] 20h check: lottery_draws có", count, "bản ghi cho", today);
-    if (count > 0) {
-      console.log("[LotterySync] 20h check: đã có data", today, "→ bỏ qua");
-      return;
+    for (const drawDate of datesToCheck) {
+      const { rows } = await pool.query(
+        "SELECT COUNT(*) AS c FROM lottery_draws WHERE draw_date = $1::date",
+        [drawDate]
+      );
+      const count = parseInt(rows[0]?.c ?? 0, 10);
+      if (count > 0) {
+        console.log("[LotterySync] 20h check:", drawDate, "đã có", count, "bản ghi → bỏ qua");
+        continue;
+      }
+      console.log("[LotterySync] 20h backfill: bắt đầu gọi xoso188 cho MN, MT, MB (draw_date=" + drawDate + ")");
+      const allDraws = [];
+      for (const region of ["mn", "mt", "mb"]) {
+        const draws = await fetchXoso188ForRegion(region, drawDate);
+        allDraws.push(...draws);
+        console.log("[LotterySync] 20h backfill:", drawDate, region.toUpperCase(), "lấy được", draws.length, "draws");
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      if (allDraws.length === 0) {
+        console.warn("[LotterySync] 20h backfill: xoso188 không trả về kết quả cho", drawDate);
+        continue;
+      }
+      console.log("[LotterySync] 20h backfill: tổng", allDraws.length, "draws cho", drawDate, ", đang import...");
+      const result = await importLotteryResults({ draws: allDraws });
+      console.log("[LotterySync] 20h backfill đã lưu", drawDate, ":", result);
     }
-    console.log("[LotterySync] 20h backfill: bắt đầu gọi xoso188 cho MN, MT, MB (draw_date=" + today + ")");
-    const allDraws = [];
-    for (const region of ["mn", "mt", "mb"]) {
-      const draws = await fetchXoso188ForRegion(region, today);
-      allDraws.push(...draws);
-      console.log("[LotterySync] 20h backfill:", region.toUpperCase(), "lấy được", draws.length, "draws");
-      await new Promise((r) => setTimeout(r, 300));
-    }
-    if (allDraws.length === 0) {
-      console.warn("[LotterySync] 20h backfill: xoso188 không trả về kết quả cho", today);
-      return;
-    }
-    console.log("[LotterySync] 20h backfill: tổng", allDraws.length, "draws, đang import vào DB...");
-    const result = await importLotteryResults({ draws: allDraws });
-    console.log("[LotterySync] 20h backfill đã lưu:", result);
   } catch (err) {
     console.error("[LotterySync] 20h backfill lỗi:", err.message);
   }
