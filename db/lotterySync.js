@@ -6,20 +6,22 @@
  *    cho đến khi lấy được kết quả → lưu DB → ngưng poll.
  * 2) Nguồn API (chỉ server cron gọi):
  *    - Ưu tiên: MINH_NGOC_BASE (Minh Ngọc) – lấy kết quả trực tiếp ngày hôm đó.
- *    - Fallback: nếu Minh Ngọc không lấy được thì gọi XOSO188_API (header chuẩn) → lưu DB.
+ *    - Fallback: nếu Minh Ngọc không lấy được thì gọi xoso188 qua Cloudflare Worker → lưu DB.
  * 3) 20h cuối ngày (giờ VN): kiểm tra lottery_draws đã có data ngày hôm nay chưa.
  *    Nếu chưa → gọi xoso188 lấy toàn bộ 3 miền cho ngày đó → lưu DB. Nếu có rồi → bỏ qua.
  */
 
 import fetch from "node-fetch";
-import { HttpsProxyAgent } from "https-proxy-agent";
 import cron from "node-cron";
-import { getCurrentProxy, onProxyFailed, initProxyRefresh } from "./getProxy.js";
 
 // ---------- API server tự cron gọi (không dùng cho web gi8 / client) ----------
 const MINH_NGOC_BASE = "https://dc.minhngoc.net/O0O/0/xstt";
 const XOSO188_API =
   "https://xoso188.net/api/front/open/lottery/history/list/game";
+// Cloudflare Worker proxy: gọi Worker thay vì xoso188 trực tiếp (tránh bị chặn trên Railway). Có thể override bằng env XOSO188_WORKER_URL.
+const XOSO188_WORKER_URL =
+  process.env.XOSO188_WORKER_URL || "https://xoso188-proxy.xoso188-proxy.workers.dev";
+const getXoso188BaseUrl = () => (XOSO188_WORKER_URL || XOSO188_API).replace(/\/$/, "");
 
 // ---------- Lịch cụ thể từng miền: giờ bắt đầu poll → kết thúc giờ xổ ----------
 // Bắt đầu poll trước 2 phút so với giờ quay; poll đến khi có kết quả hoặc hết khung.
@@ -253,23 +255,15 @@ async function fetchMinhNgoc(region) {
   }
 }
 
-// ---------- API phụ: xoso188 (XOSO188_API) – chỉ dùng khi Minh Ngọc không lấy được ----------
-// Dùng proxy (env hoặc free proxy). Mỗi lần fail → đổi proxy → gọi lại API (tối đa MAX_XOSO188_RETRIES lần).
+// ---------- API phụ: xoso188 – gọi qua Cloudflare Worker (chỉ dùng khi Minh Ngọc không lấy được) ----------
 const MAX_XOSO188_RETRIES = 5;
 
-function getProxyAgent() {
-  const proxyUrl = process.env.XOSO188_PROXY || process.env.HTTP_PROXY || getCurrentProxy();
-  if (!proxyUrl) return undefined;
-  return new HttpsProxyAgent(proxyUrl);
-}
-
 async function fetchXoso188Game(gameCode, limitNum = 10, retryCount = 0) {
-  const url = `${XOSO188_API}?limitNum=${limitNum}&gameCode=${gameCode}`;
-  const agent = getProxyAgent();
+  const baseUrl = getXoso188BaseUrl();
+  const url = `${baseUrl}?limitNum=${limitNum}&gameCode=${gameCode}`;
   const options = {
-    headers: XOSO188_HEADERS,
+    headers: { Accept: "application/json" },
     timeout: 20000,
-    ...(agent && { agent }),
   };
   try {
     const res = await fetch(url, options);
@@ -277,7 +271,6 @@ async function fetchXoso188Game(gameCode, limitNum = 10, retryCount = 0) {
     if (!res.ok) {
       console.warn("[xoso188]", gameCode, "status", res.status, "retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
       if (retryCount < MAX_XOSO188_RETRIES - 1) {
-        await onProxyFailed();
         return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
       }
       return [];
@@ -288,7 +281,6 @@ async function fetchXoso188Game(gameCode, limitNum = 10, retryCount = 0) {
     } catch (_) {
       console.warn("[xoso188]", gameCode, "response không phải JSON, retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
       if (retryCount < MAX_XOSO188_RETRIES - 1) {
-        await onProxyFailed();
         return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
       }
       return [];
@@ -298,7 +290,6 @@ async function fetchXoso188Game(gameCode, limitNum = 10, retryCount = 0) {
     if (arr.length === 0 && (data?.code !== 0 || !data?.success)) {
       console.warn("[xoso188]", gameCode, "issueList rỗng, retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
       if (retryCount < MAX_XOSO188_RETRIES - 1) {
-        await onProxyFailed();
         return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
       }
     }
@@ -306,7 +297,6 @@ async function fetchXoso188Game(gameCode, limitNum = 10, retryCount = 0) {
   } catch (err) {
     console.warn("[xoso188]", gameCode, err.message, "retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
     if (retryCount < MAX_XOSO188_RETRIES - 1) {
-      await onProxyFailed();
       return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
     }
     return [];
@@ -512,8 +502,6 @@ export function scheduleLotterySync(pool, importLotteryResults) {
     console.warn("[LotterySync] Bỏ qua cron: thiếu pool hoặc importLotteryResults");
     return;
   }
-  // Proxy free: lấy list mỗi 8h; khi gọi xoso188 fail thì đổi proxy. Nếu có XOSO188_PROXY/HTTP_PROXY thì dùng env.
-  initProxyRefresh(8 * 60 * 60 * 1000);
   const tz = "Asia/Ho_Chi_Minh";
   cron.schedule(REGION_SCHEDULE.mn.cronAt, () => {
     console.log("[LotterySync] Cron:", REGION_SCHEDULE.mn.label, "16:13", new Date().toISOString());
