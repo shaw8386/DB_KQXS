@@ -1,18 +1,50 @@
 /**
- * Tự động lấy kết quả xổ số theo giờ quay từng miền:
- * - Miền Nam: 16:13 bắt đầu poll (giờ quay 16:15-16:35)
- * - Miền Trung: 17:13 bắt đầu poll (17:15-17:35)
- * - Miền Bắc: 18:13 bắt đầu poll (18:15-18:35)
- * Poll mỗi 5s; ưu tiên API Minh Ngọc, không có thì fallback xoso188 (header chuẩn).
- * Lấy đủ kết quả → lưu DB → ngưng poll.
+ * LOTTERY SYNC – Automation của server (không liên quan web gi8 / client).
+ * Mục đích: Tự động lấy kết quả xổ số cuối ngày → lưu vào DB server → cho user/client dùng sau.
+ *
+ * 1) Lịch từng miền: từ giờ bắt đầu → đến hết giờ xổ của miền đó, gọi liên tục mỗi 5s
+ *    cho đến khi lấy được kết quả → lưu DB → ngưng poll.
+ * 2) Nguồn API (chỉ server cron gọi):
+ *    - Ưu tiên: MINH_NGOC_BASE (Minh Ngọc) – lấy kết quả trực tiếp ngày hôm đó.
+ *    - Fallback: nếu Minh Ngọc không lấy được thì gọi XOSO188_API (header chuẩn) → lưu DB.
  */
 
 import fetch from "node-fetch";
 import cron from "node-cron";
 
+// ---------- API server tự cron gọi (không dùng cho web gi8 / client) ----------
 const MINH_NGOC_BASE = "https://dc.minhngoc.net/O0O/0/xstt";
 const XOSO188_API =
   "https://xoso188.net/api/front/open/lottery/history/list/game";
+
+// ---------- Lịch cụ thể từng miền: giờ bắt đầu poll → kết thúc giờ xổ ----------
+// Bắt đầu poll trước 2 phút so với giờ quay; poll đến khi có kết quả hoặc hết khung.
+const REGION_SCHEDULE = {
+  mn: {
+    label: "Miền Nam",
+    cronAt: "13 16 * * *",       // 16:13 mỗi ngày
+    drawStart: "16:15",
+    drawEnd: "16:35",
+    pollIntervalMs: 5000,
+    maxPollDurationMs: 25 * 60 * 1000, // tối đa ~25 phút (qua giờ xổ)
+  },
+  mt: {
+    label: "Miền Trung",
+    cronAt: "13 17 * * *",      // 17:13
+    drawStart: "17:15",
+    drawEnd: "17:35",
+    pollIntervalMs: 5000,
+    maxPollDurationMs: 25 * 60 * 1000,
+  },
+  mb: {
+    label: "Miền Bắc",
+    cronAt: "13 18 * * *",      // 18:13
+    drawStart: "18:15",
+    drawEnd: "18:35",
+    pollIntervalMs: 5000,
+    maxPollDurationMs: 25 * 60 * 1000,
+  },
+};
 
 // Header giống tools/fetch_lottery_and_upload.py (để xoso188 không chặn)
 const XOSO188_HEADERS = {
@@ -179,9 +211,9 @@ function issuesToDraws(gameCode, issues, filterDrawDate) {
   return draws;
 }
 
-// ---------- Minh Ngọc ----------
-// API trả về dạng: kqxs.mn={run:0,tinh:"1,19,21,20",ntime:...,delay:5000};
-// Thường chỉ có metadata, không có số giải → trả null để fallback xoso188
+// ---------- API chính: Minh Ngọc (MINH_NGOC_BASE) – kết quả trực tiếp ngày hôm đó ----------
+// Server cron gọi trước; nếu không có kết quả thì mới dùng xoso188.
+// Response mẫu: kqxs.mn={run:0,tinh:"1,19,21,20",ntime:...,delay:5000} — hiện chỉ metadata, chưa có số giải → trả null → fallback xoso188.
 async function fetchMinhNgoc(region) {
   const urls = {
     mn: `${MINH_NGOC_BASE}/js_m1.js`,
@@ -204,10 +236,8 @@ async function fetchMinhNgoc(region) {
     } catch {
       return null;
     }
-    // Nếu có run=1 và dữ liệu số (sau này có thể mở rộng parse) thì trả draws
-    // Hiện response mẫu chỉ có run,tinh,ntime,delay → không đủ để build draws
     if (data.run === 1 && data.result) {
-      // TODO: parse data.result theo format Minh Ngọc nếu có
+      // TODO: khi Minh Ngọc trả về số giải (data.result), parse thành draws ở đây
       return null;
     }
     return null;
@@ -217,7 +247,7 @@ async function fetchMinhNgoc(region) {
   }
 }
 
-// ---------- xoso188 fallback ----------
+// ---------- API phụ: xoso188 (XOSO188_API) – chỉ dùng khi Minh Ngọc không lấy được ----------
 async function fetchXoso188Game(gameCode, limitNum = 10) {
   const url = `${XOSO188_API}?limitNum=${limitNum}&gameCode=${gameCode}`;
   try {
@@ -272,34 +302,44 @@ async function fetchXoso188ForRegion(region, filterDrawDate) {
   return allDraws;
 }
 
-const POLL_MS = 5000;
-const MAX_POLL_UNTIL_MS = 25 * 60 * 1000; // tối đa ~25 phút (qua khung giờ quay)
-
 let pollIntervals = { mn: null, mt: null, mb: null };
 
 /**
- * Poll mỗi 5s: thử Minh Ngọc rồi xoso188. Khi có draws (ngày hôm nay) → import → dừng.
+ * Poll liên tục từ giờ bắt đầu → đến khi có kết quả hoặc hết khung giờ xổ:
+ * 1) Gọi API Minh Ngọc (MINH_NGOC_BASE) lấy kết quả trực tiếp ngày hôm đó.
+ * 2) Nếu không lấy được → gọi XOSO188_API (fallback) với header chuẩn.
+ * Khi có draws ngày hôm nay → import vào DB → ngưng poll.
  * @param {string} region - 'mn' | 'mt' | 'mb'
  * @param {object} pool - pg.Pool
  * @param {Function} importLotteryResults - (payload) => Promise<{ imported, skipped }>
  */
 async function pollUntilResult(region, pool, importLotteryResults) {
   if (pollIntervals[region]) return;
+  const schedule = REGION_SCHEDULE[region];
+  if (!schedule) return;
   const today = getTodayDrawDate();
-  const regionLabel = { mn: "Miền Nam", mt: "Miền Trung", mb: "Miền Bắc" }[region];
-  console.log(`[LotterySync] Bắt đầu poll ${regionLabel} (${today}), mỗi ${POLL_MS / 1000}s`);
+  const { label, pollIntervalMs, maxPollDurationMs } = schedule;
+  console.log(`[LotterySync] ${label}: bắt đầu poll (${today}), giờ xổ ${schedule.drawStart}–${schedule.drawEnd}, mỗi ${pollIntervalMs / 1000}s`);
 
   const start = Date.now();
+  let loggedFallback = false;
+
   const tick = async () => {
-    if (Date.now() - start > MAX_POLL_UNTIL_MS) {
+    if (Date.now() - start > maxPollDurationMs) {
       clearInterval(pollIntervals[region]);
       pollIntervals[region] = null;
-      console.warn(`[LotterySync] Hết thời gian poll ${regionLabel}`);
+      console.warn(`[LotterySync] ${label}: hết khung giờ xổ, ngưng poll`);
       return;
     }
 
+    // 1) Ưu tiên Minh Ngọc – lấy kết quả trực tiếp ngày hôm đó
     let draws = await fetchMinhNgoc(region);
+    // 2) Không có thì fallback xoso188
     if (!draws || draws.length === 0) {
+      if (!loggedFallback) {
+        console.log(`[LotterySync] ${label}: Minh Ngọc chưa có kết quả → fallback xoso188`);
+        loggedFallback = true;
+      }
       draws = await fetchXoso188ForRegion(region, today);
     }
 
@@ -310,7 +350,7 @@ async function pollUntilResult(region, pool, importLotteryResults) {
         pollIntervals[region] = null;
         try {
           const result = await importLotteryResults({ draws: forToday });
-          console.log(`[LotterySync] ${regionLabel} đã lưu:`, result);
+          console.log(`[LotterySync] ${label} đã lưu DB:`, result);
         } catch (err) {
           console.error("[LotterySync] Import lỗi:", err.message);
         }
@@ -319,7 +359,7 @@ async function pollUntilResult(region, pool, importLotteryResults) {
   };
 
   await tick();
-  pollIntervals[region] = setInterval(tick, POLL_MS);
+  pollIntervals[region] = setInterval(tick, pollIntervalMs);
 }
 
 /**
@@ -351,7 +391,29 @@ export async function runSyncTest(region) {
 }
 
 /**
- * Đăng ký cron: 16:13 MN, 17:13 MT, 18:13 MB (giờ VN, TZ đã set Asia/Ho_Chi_Minh).
+ * Gọi sync cho một miền ngay (từ HTTP trigger hoặc cron ngoài).
+ * Trả về ngay; poll chạy nền. Dùng khi Railway sleep hoặc cron trong process không chạy đúng giờ.
+ * @param {string} region - 'mn' | 'mt' | 'mb'
+ * @param {object} pool - pg.Pool
+ * @param {Function} importLotteryResults - (payload) => Promise<{ imported, skipped }>
+ */
+export function triggerRegionSync(region, pool, importLotteryResults) {
+  if (!pool || !importLotteryResults) {
+    console.warn("[LotterySync] triggerRegionSync: thiếu pool hoặc importLotteryResults");
+    return;
+  }
+  const r = (region || "").toLowerCase();
+  if (r !== "mn" && r !== "mt" && r !== "mb") {
+    console.warn("[LotterySync] triggerRegionSync: region phải là mn | mt | mb");
+    return;
+  }
+  console.log("[LotterySync] Trigger thủ công:", { mn: "Miền Nam", mt: "Miền Trung", mb: "Miền Bắc" }[r], new Date().toISOString());
+  pollUntilResult(r, pool, importLotteryResults);
+}
+
+/**
+ * Đăng ký cron nội bộ: mỗi ngày đúng giờ bắt đầu poll từng miền (server automation, không liên quan client).
+ * MN 16:13, MT 17:13, MB 18:13 (giờ VN) → gọi liên tục Minh Ngọc (rồi fallback xoso188) đến khi có kết quả → lưu DB.
  * @param {object} pool - pg.Pool
  * @param {Function} importLotteryResults - (payload) => Promise<{ imported, skipped }>
  */
@@ -360,9 +422,18 @@ export function scheduleLotterySync(pool, importLotteryResults) {
     console.warn("[LotterySync] Bỏ qua cron: thiếu pool hoặc importLotteryResults");
     return;
   }
-  // 13 phút, giờ 16 / 17 / 18, mỗi ngày
-  cron.schedule("13 16 * * *", () => pollUntilResult("mn", pool, importLotteryResults), { timezone: "Asia/Ho_Chi_Minh" });
-  cron.schedule("13 17 * * *", () => pollUntilResult("mt", pool, importLotteryResults), { timezone: "Asia/Ho_Chi_Minh" });
-  cron.schedule("13 18 * * *", () => pollUntilResult("mb", pool, importLotteryResults), { timezone: "Asia/Ho_Chi_Minh" });
-  console.log("[LotterySync] Đã lên lịch: 16:13 MN, 17:13 MT, 18:13 MB (mỗi 5s đến khi có kết quả)");
+  const tz = "Asia/Ho_Chi_Minh";
+  cron.schedule(REGION_SCHEDULE.mn.cronAt, () => {
+    console.log("[LotterySync] Cron:", REGION_SCHEDULE.mn.label, "16:13", new Date().toISOString());
+    pollUntilResult("mn", pool, importLotteryResults);
+  }, { timezone: tz });
+  cron.schedule(REGION_SCHEDULE.mt.cronAt, () => {
+    console.log("[LotterySync] Cron:", REGION_SCHEDULE.mt.label, "17:13", new Date().toISOString());
+    pollUntilResult("mt", pool, importLotteryResults);
+  }, { timezone: tz });
+  cron.schedule(REGION_SCHEDULE.mb.cronAt, () => {
+    console.log("[LotterySync] Cron:", REGION_SCHEDULE.mb.label, "18:13", new Date().toISOString());
+    pollUntilResult("mb", pool, importLotteryResults);
+  }, { timezone: tz });
+  console.log("[LotterySync] Đã lên lịch (automation server): MN 16:13, MT 17:13, MB 18:13 VN — API ưu tiên Minh Ngọc, fallback xoso188 → lưu DB.");
 }
