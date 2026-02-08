@@ -254,14 +254,16 @@ async function fetchMinhNgoc(region) {
 }
 
 // ---------- API phụ: xoso188 (XOSO188_API) – chỉ dùng khi Minh Ngọc không lấy được ----------
-// Dùng proxy (env XOSO188_PROXY/HTTP_PROXY hoặc free proxy từ getProxy) để tránh Railway bị chặn
+// Dùng proxy (env hoặc free proxy). Mỗi lần fail → đổi proxy → gọi lại API (tối đa MAX_XOSO188_RETRIES lần).
+const MAX_XOSO188_RETRIES = 5;
+
 function getProxyAgent() {
   const proxyUrl = process.env.XOSO188_PROXY || process.env.HTTP_PROXY || getCurrentProxy();
   if (!proxyUrl) return undefined;
   return new HttpsProxyAgent(proxyUrl);
 }
 
-async function fetchXoso188Game(gameCode, limitNum = 10, retrying = false) {
+async function fetchXoso188Game(gameCode, limitNum = 10, retryCount = 0) {
   const url = `${XOSO188_API}?limitNum=${limitNum}&gameCode=${gameCode}`;
   const agent = getProxyAgent();
   const options = {
@@ -273,10 +275,10 @@ async function fetchXoso188Game(gameCode, limitNum = 10, retrying = false) {
     const res = await fetch(url, options);
     const raw = await res.text();
     if (!res.ok) {
-      console.warn("[xoso188]", gameCode, "status", res.status, "body:", raw.slice(0, 200));
-      if (!retrying) {
+      console.warn("[xoso188]", gameCode, "status", res.status, "retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
+      if (retryCount < MAX_XOSO188_RETRIES - 1) {
         await onProxyFailed();
-        return fetchXoso188Game(gameCode, limitNum, true);
+        return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
       }
       return [];
     }
@@ -284,28 +286,28 @@ async function fetchXoso188Game(gameCode, limitNum = 10, retrying = false) {
     try {
       data = JSON.parse(raw);
     } catch (_) {
-      console.warn("[xoso188]", gameCode, "response không phải JSON, snippet:", raw.slice(0, 150));
-      if (!retrying) {
+      console.warn("[xoso188]", gameCode, "response không phải JSON, retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
+      if (retryCount < MAX_XOSO188_RETRIES - 1) {
         await onProxyFailed();
-        return fetchXoso188Game(gameCode, limitNum, true);
+        return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
       }
       return [];
     }
     const list = data?.t?.issueList ?? [];
     const arr = Array.isArray(list) ? list : [];
     if (arr.length === 0 && (data?.code !== 0 || !data?.success)) {
-      console.warn("[xoso188]", gameCode, "issueList rỗng, response:", JSON.stringify(data).slice(0, 250));
-      if (!retrying) {
+      console.warn("[xoso188]", gameCode, "issueList rỗng, retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
+      if (retryCount < MAX_XOSO188_RETRIES - 1) {
         await onProxyFailed();
-        return fetchXoso188Game(gameCode, limitNum, true);
+        return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
       }
     }
     return arr;
   } catch (err) {
-    console.warn("[xoso188]", gameCode, err.message);
-    if (!retrying) {
+    console.warn("[xoso188]", gameCode, err.message, "retry", retryCount + 1 + "/" + MAX_XOSO188_RETRIES);
+    if (retryCount < MAX_XOSO188_RETRIES - 1) {
       await onProxyFailed();
-      return fetchXoso188Game(gameCode, limitNum, true);
+      return fetchXoso188Game(gameCode, limitNum, retryCount + 1);
     }
     return [];
   }
