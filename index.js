@@ -5,7 +5,7 @@ import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as db from "./db/index.js";
-import { XOSO188_HEADERS, pingXoso188 } from "./db/lotterySync.js";
+import { XOSO188_HEADERS, pingXoso188, triggerRegionSync } from "./db/lotterySync.js";
 
 process.env.TZ = "Asia/Ho_Chi_Minh";
 
@@ -221,6 +221,26 @@ app.get("/api/lottery/sync-test", async (req, res) => {
   }
 });
 
+// GET /api/lottery/trigger-sync?region=mn|mt|mb - Gọi sync theo lịch (cần x-gi8-key).
+// Dùng khi cron trong process không chạy (Railway sleep): cron ngoài gọi đúng giờ 16:13 / 17:13 / 18:13 VN.
+app.get("/api/lottery/trigger-sync", (req, res) => {
+  if (!db.pool) {
+    return res.status(503).json({ success: false, msg: "DB chưa sẵn sàng", code: 503 });
+  }
+  const region = (req.query.region || "").toLowerCase();
+  if (region !== "mn" && region !== "mt" && region !== "mb") {
+    return res.status(400).json({ success: false, msg: "region phải là mn | mt | mb", code: 400 });
+  }
+  triggerRegionSync(region, db.pool, db.importLotteryResults);
+  const label = { mn: "Miền Nam (16:15)", mt: "Miền Trung (17:15)", mb: "Miền Bắc (18:15)" }[region];
+  return res.status(202).json({
+    success: true,
+    msg: `Đã kích hoạt sync ${label}. Poll 5s đến khi có kết quả rồi lưu DB.`,
+    code: 0,
+    region,
+  });
+});
+
 // GET /api/lottery/db/draws?date=DD/MM/YYYY&region=MB|MT|MN - Lấy kết quả theo ngày
 app.get("/api/lottery/db/draws", async (req, res) => {
   if (!db.pool) {
@@ -296,7 +316,12 @@ app.listen(PORT, () => {
   db
     .initDb()
     .then(async (pool) => {
-      if (pool) db.scheduleLotterySync(pool, db.importLotteryResults);
+      if (pool) {
+        db.scheduleLotterySync(pool, db.importLotteryResults);
+        console.log("[Startup] LotterySync: cron nội bộ đã đăng ký. Nếu Railway sleep lúc 16:13/17:13/18:13 VN, hãy dùng cron ngoài gọi GET /api/lottery/trigger-sync?region=mn|mt|mb với header x-gi8-key.");
+      } else {
+        console.warn("[Startup] DB init trả null → không chạy scheduleLotterySync. Kiểm tra DATABASE_URL và log lỗi phía trên.");
+      }
       const ping = await pingXoso188();
       console.log("[Startup] xoso188:", ping.ok ? "OK (count=" + ping.count + ")" : "FAIL", ping.message || "");
     })
