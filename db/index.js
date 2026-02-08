@@ -14,16 +14,74 @@ if (process.env.DATABASE_URL) {
   });
 }
 
+// Fallback khi deploy container không có file db/*.sql (Railway/Docker)
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS regions (
+  id SERIAL PRIMARY KEY,
+  code VARCHAR(10) UNIQUE NOT NULL,
+  name VARCHAR(100) NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lottery_provinces (
+  id SERIAL PRIMARY KEY,
+  region_id INTEGER NOT NULL REFERENCES regions(id),
+  code VARCHAR(20) NOT NULL,
+  name VARCHAR(100) NOT NULL,
+  api_game_code VARCHAR(20),
+  UNIQUE(region_id, code)
+);
+CREATE TABLE IF NOT EXISTS lottery_draws (
+  id SERIAL PRIMARY KEY,
+  draw_date DATE NOT NULL,
+  province_id INTEGER NOT NULL REFERENCES lottery_provinces(id),
+  region_id INTEGER NOT NULL REFERENCES regions(id),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(draw_date, province_id)
+);
+CREATE TABLE IF NOT EXISTS lottery_results (
+  id SERIAL PRIMARY KEY,
+  draw_id INTEGER NOT NULL REFERENCES lottery_draws(id) ON DELETE CASCADE,
+  prize_code VARCHAR(10) NOT NULL,
+  prize_order INTEGER NOT NULL DEFAULT 1,
+  result_number VARCHAR(20) NOT NULL,
+  UNIQUE(draw_id, prize_code, prize_order)
+);
+CREATE INDEX IF NOT EXISTS idx_lottery_draws_date ON lottery_draws(draw_date);
+CREATE INDEX IF NOT EXISTS idx_lottery_draws_province ON lottery_draws(province_id);
+CREATE INDEX IF NOT EXISTS idx_lottery_draws_region ON lottery_draws(region_id);
+CREATE INDEX IF NOT EXISTS idx_lottery_results_draw ON lottery_results(draw_id);
+INSERT INTO regions (id, code, name) VALUES (1, 'MB', 'Miền Bắc'), (2, 'MT', 'Miền Trung'), (3, 'MN', 'Miền Nam') ON CONFLICT (code) DO NOTHING;
+`;
+
+const PROVINCES_SEED_SQL = `
+INSERT INTO lottery_provinces (region_id, code, name, api_game_code) VALUES
+  (1, 'TB', 'Thái Bình', 'miba'), (1, 'HN', 'Hà Nội', 'miba'), (1, 'QN', 'Quảng Ninh', 'miba'), (1, 'BN', 'Bắc Ninh', 'miba'), (1, 'HP', 'Hải Phòng', 'miba'), (1, 'ND', 'Nam Định', 'miba')
+ON CONFLICT (region_id, code) DO NOTHING;
+INSERT INTO lottery_provinces (region_id, code, name, api_game_code) VALUES
+  (2, 'DN', 'Đà Nẵng', 'dana'), (2, 'BDI', 'Bình Định', 'bidi'), (2, 'DLK', 'Đắk Lắk', 'dalak'), (2, 'DNO', 'Đắk Nông', 'dano'), (2, 'GLA', 'Gia Lai', 'gila'), (2, 'KHO', 'Khánh Hòa', 'khho'), (2, 'KTU', 'Kon Tum', 'kotu'), (2, 'NTH', 'Ninh Thuận', 'nith'), (2, 'PYE', 'Phú Yên', 'phye'), (2, 'QBI', 'Quảng Bình', 'qubi'), (2, 'QNM', 'Quảng Nam', 'quna'), (2, 'QNG', 'Quảng Ngãi', 'qung'), (2, 'QTR', 'Quảng Trị', 'qutr'), (2, 'THH', 'Thừa Thiên Huế', 'thth')
+ON CONFLICT (region_id, code) DO NOTHING;
+INSERT INTO lottery_provinces (region_id, code, name, api_game_code) VALUES
+  (3, 'AGI', 'An Giang', 'angi'), (3, 'BLI', 'Bạc Liêu', 'bali'), (3, 'BDU', 'Bình Dương', 'bidu'), (3, 'BPH', 'Bình Phước', 'biph'), (3, 'CMA', 'Cà Mau', 'cama'), (3, 'CTH', 'Cần Thơ', 'cath'), (3, 'DLT', 'Đà Lạt', 'dalat'), (3, 'DNA', 'Đồng Nai', 'dona'), (3, 'DTH', 'Đồng Tháp', 'doth'), (3, 'HGI', 'Hậu Giang', 'hagi'), (3, 'KGI', 'Kiên Giang', 'kigi'), (3, 'LAN', 'Long An', 'loan'), (3, 'STR', 'Sóc Trăng', 'sotr'), (3, 'TNI', 'Tây Ninh', 'tani'), (3, 'TGI', 'Tiền Giang', 'tigi'), (3, 'HCM', 'TP. Hồ Chí Minh', 'tphc'), (3, 'TVI', 'Trà Vinh', 'trvi'), (3, 'VLO', 'Vĩnh Long', 'vilo'), (3, 'VTA', 'Vũng Tàu', 'vuta')
+ON CONFLICT (region_id, code) DO NOTHING;
+`;
+
+function readSqlFile(name, fallback) {
+  const p = path.join(__dirname, name);
+  try {
+    if (fs.existsSync(p)) return fs.readFileSync(p, "utf8");
+  } catch (_) {}
+  return fallback;
+}
+
 export async function initDb() {
   if (!process.env.DATABASE_URL) {
     console.warn("⚠ DATABASE_URL not set – DB features disabled");
     return null;
   }
   try {
-    const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
+    const schema = readSqlFile("schema.sql", SCHEMA_SQL);
     await pool.query(schema);
 
-    const provinces = fs.readFileSync(path.join(__dirname, "provinces-seed.sql"), "utf8");
+    const provinces = readSqlFile("provinces-seed.sql", PROVINCES_SEED_SQL);
     await pool.query(provinces);
 
     console.log("✅ DB initialized");
