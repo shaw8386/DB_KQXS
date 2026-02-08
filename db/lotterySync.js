@@ -48,13 +48,14 @@ const REGION_SCHEDULE = {
   },
 };
 
-// Header giống tools/fetch_lottery_and_upload.py (để xoso188 không chặn)
+// Header khớp tools/fetch_lottery_and_upload.py BROWSER_HEADERS (từ DevTools xoso188 - Edge)
 const XOSO188_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0",
   Accept:
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br, zstd",
   "Cache-Control": "max-age=0",
   "Sec-Ch-Ua":
     '"Not(A:Brand";v="8", "Chromium";v="144", "Microsoft Edge";v="144"',
@@ -65,6 +66,7 @@ const XOSO188_HEADERS = {
   "Sec-Fetch-Site": "none",
   "Sec-Fetch-User": "?1",
   "Upgrade-Insecure-Requests": "1",
+  Priority: "u=0, i",
 };
 
 const PRIZE_CODES = ["DB", "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"];
@@ -250,17 +252,32 @@ async function fetchMinhNgoc(region) {
 }
 
 // ---------- API phụ: xoso188 (XOSO188_API) – chỉ dùng khi Minh Ngọc không lấy được ----------
+// Giữ Accept giống Python (text/html...) để xoso188 trả JSON như browser; không ghi đè Accept: application/json
 async function fetchXoso188Game(gameCode, limitNum = 10) {
   const url = `${XOSO188_API}?limitNum=${limitNum}&gameCode=${gameCode}`;
   try {
     const res = await fetch(url, {
-      headers: { ...XOSO188_HEADERS, Accept: "application/json" },
+      headers: XOSO188_HEADERS,
       timeout: 20000,
     });
-    if (!res.ok) return [];
-    const data = await res.json();
+    const raw = await res.text();
+    if (!res.ok) {
+      console.warn("[xoso188]", gameCode, "status", res.status, "body:", raw.slice(0, 200));
+      return [];
+    }
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (_) {
+      console.warn("[xoso188]", gameCode, "response không phải JSON, snippet:", raw.slice(0, 150));
+      return [];
+    }
     const list = data?.t?.issueList ?? [];
-    return Array.isArray(list) ? list : [];
+    const arr = Array.isArray(list) ? list : [];
+    if (arr.length === 0 && (data?.code !== 0 || !data?.success)) {
+      console.warn("[xoso188]", gameCode, "issueList rỗng, response:", JSON.stringify(data).slice(0, 250));
+    }
+    return arr;
   } catch (err) {
     console.warn("[xoso188]", gameCode, err.message);
     return [];
