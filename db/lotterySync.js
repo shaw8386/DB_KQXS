@@ -7,6 +7,8 @@
  * 2) Nguồn API (chỉ server cron gọi):
  *    - Ưu tiên: MINH_NGOC_BASE (Minh Ngọc) – lấy kết quả trực tiếp ngày hôm đó.
  *    - Fallback: nếu Minh Ngọc không lấy được thì gọi XOSO188_API (header chuẩn) → lưu DB.
+ * 3) 20h cuối ngày (giờ VN): kiểm tra lottery_draws đã có data ngày hôm nay chưa.
+ *    Nếu chưa → gọi xoso188 lấy toàn bộ 3 miền cho ngày đó → lưu DB. Nếu có rồi → bỏ qua.
  */
 
 import fetch from "node-fetch";
@@ -305,6 +307,48 @@ async function fetchXoso188ForRegion(region, filterDrawDate) {
 let pollIntervals = { mn: null, mt: null, mb: null };
 
 /**
+ * 20h cuối ngày (giờ VN): kiểm tra bảng lottery_draws đã có data của ngày hôm nay chưa.
+ * Nếu chưa → gọi API xoso188 lấy toàn bộ 3 miền (MN, MT, MB) cho ngày đó → lưu DB.
+ * Nếu đã có → bỏ qua.
+ * @param {object} pool - pg.Pool
+ * @param {Function} importLotteryResults - (payload) => Promise<{ imported, skipped }>
+ */
+async function checkAndBackfillToday(pool, importLotteryResults) {
+  if (!pool || !importLotteryResults) return;
+  const today = getTodayDrawDate();
+  console.log("[LotterySync] 20h check: bắt đầu kiểm tra draw_date=" + today);
+  try {
+    const { rows } = await pool.query(
+      "SELECT COUNT(*) AS c FROM lottery_draws WHERE draw_date = $1::date",
+      [today]
+    );
+    const count = parseInt(rows[0]?.c ?? 0, 10);
+    console.log("[LotterySync] 20h check: lottery_draws có", count, "bản ghi cho", today);
+    if (count > 0) {
+      console.log("[LotterySync] 20h check: đã có data", today, "→ bỏ qua");
+      return;
+    }
+    console.log("[LotterySync] 20h backfill: bắt đầu gọi xoso188 cho MN, MT, MB (draw_date=" + today + ")");
+    const allDraws = [];
+    for (const region of ["mn", "mt", "mb"]) {
+      const draws = await fetchXoso188ForRegion(region, today);
+      allDraws.push(...draws);
+      console.log("[LotterySync] 20h backfill:", region.toUpperCase(), "lấy được", draws.length, "draws");
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    if (allDraws.length === 0) {
+      console.warn("[LotterySync] 20h backfill: xoso188 không trả về kết quả cho", today);
+      return;
+    }
+    console.log("[LotterySync] 20h backfill: tổng", allDraws.length, "draws, đang import vào DB...");
+    const result = await importLotteryResults({ draws: allDraws });
+    console.log("[LotterySync] 20h backfill đã lưu:", result);
+  } catch (err) {
+    console.error("[LotterySync] 20h backfill lỗi:", err.message);
+  }
+}
+
+/**
  * Poll liên tục từ giờ bắt đầu → đến khi có kết quả hoặc hết khung giờ xổ:
  * 1) Gọi API Minh Ngọc (MINH_NGOC_BASE) lấy kết quả trực tiếp ngày hôm đó.
  * 2) Nếu không lấy được → gọi XOSO188_API (fallback) với header chuẩn.
@@ -435,5 +479,12 @@ export function scheduleLotterySync(pool, importLotteryResults) {
     console.log("[LotterySync] Cron:", REGION_SCHEDULE.mb.label, "18:13", new Date().toISOString());
     pollUntilResult("mb", pool, importLotteryResults);
   }, { timezone: tz });
-  console.log("[LotterySync] Đã lên lịch (automation server): MN 16:13, MT 17:13, MB 18:13 VN — API ưu tiên Minh Ngọc, fallback xoso188 → lưu DB.");
+  // 20h cuối ngày: kiểm tra đã có data ngày hôm nay chưa → chưa thì backfill từ xoso188
+  cron.schedule("0 20 * * *", () => {
+    console.log("[LotterySync] Cron: 20h check & backfill", new Date().toISOString());
+    checkAndBackfillToday(pool, importLotteryResults);
+  }, { timezone: tz });
+  // Chạy ngay khi deploy/startup (kiểm tra & backfill nếu thiếu data hôm nay)
+  checkAndBackfillToday(pool, importLotteryResults);
+  console.log("[LotterySync] Đã lên lịch (automation server): MN 16:13, MT 17:13, MB 18:13 VN; 20h check & backfill nếu thiếu data; đã chạy check ngay khi startup.");
 }
