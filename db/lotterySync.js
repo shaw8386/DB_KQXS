@@ -113,6 +113,49 @@ const GAME_TO_REGION_PROVINCE = {
   vuta: ["MN", "VTA"],
 };
 
+// Map station từ Minh Ngọc -> [region_code, province_code] trong DB
+const MINH_NGOC_STATION_TO_REGION_PROVINCE = {
+  // Miền Trung
+  dana: ["MT", "DN"],
+  bidi: ["MT", "BDI"],
+  dalak: ["MT", "DLK"],
+  dano: ["MT", "DNO"],
+  gila: ["MT", "GLA"],
+  khho: ["MT", "KHO"],
+  kotu: ["MT", "KTU"],
+  nith: ["MT", "NTH"],
+  phye: ["MT", "PYE"],
+  qubi: ["MT", "QBI"],
+  quna: ["MT", "QNM"],
+  qung: ["MT", "QNG"],
+  qutr: ["MT", "QTR"],
+  thth: ["MT", "THH"],
+
+  // Miền Nam
+  angi: ["MN", "AGI"],
+  bali: ["MN", "BLI"],
+  bidu: ["MN", "BDU"],
+  biph: ["MN", "BPH"],
+  cama: ["MN", "CMA"],
+  cath: ["MN", "CTH"],
+  dalat: ["MN", "DLT"],
+  dona: ["MN", "DNA"],
+  doth: ["MN", "DTH"],
+  hagi: ["MN", "HGI"],
+  kigi: ["MN", "KGI"],
+  loan: ["MN", "LAN"],
+  sotr: ["MN", "STR"],
+  tani: ["MN", "TNI"],
+  tigi: ["MN", "TGI"],
+  tphc: ["MN", "HCM"],
+  trvi: ["MN", "TVI"],
+  vilo: ["MN", "VLO"],
+  vuta: ["MN", "VTA"],
+
+  // Miền Bắc (nếu Minh Ngọc dùng giống xoso188)
+  miba: ["MB", null], // province_code sẽ tính theo ngày như logic hiện tại
+};
+
 const REGION_GAME_CODES = {
   mn: ["angi", "bali", "bidu", "biph", "cama", "cath", "dalat", "dona", "doth", "hagi", "kigi", "loan", "sotr", "tani", "tigi", "tphc", "trvi", "vilo", "vuta"],
   mt: ["dana", "bidi", "dalak", "dano", "gila", "khho", "kotu", "nith", "phye", "qubi", "quna", "qung", "qutr", "thth"],
@@ -155,6 +198,30 @@ function getTodayDrawDate() {
   const m = String(now.getMonth() + 1).padStart(2, "0");
   const d = String(now.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+function parseVNDateToYMD(dateStr) {
+  const s = String(dateStr || "").trim();
+  const parts = s.split(/[\/\-]/).map(Number);
+  if (parts.length < 3) return null;
+  let day, month, year;
+  if (parts[0] > 31) {
+    // format YYYY-MM-DD
+    year = parts[0];
+    month = (parts[1] || 1) - 1;
+    day = parts[2] || 1;
+  } else {
+    // format DD/MM/YYYY
+    day = parts[0] || 1;
+    month = (parts[1] || 1) - 1;
+    year = parts[2];
+  }
+  const d = new Date(year, month, day);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
 }
 
 /** Trả về ngày (YYYY-MM-DD) lùi `daysBack` ngày so với hôm nay (theo giờ VN nếu TZ đã set). */
@@ -245,20 +312,71 @@ async function fetchMinhNgoc(region) {
       timeout: 15000,
     });
     const text = await res.text();
-    const match = text.match(/kqxs\.(mn|mb|mt)\s*=\s*(\{[^}]+\})/);
+
+    // 1) Tách object kqxs.mn / kqxs.mt / kqxs.mb = {...};
+    const match = text.match(/kqxs\.(mn|mb|mt)\s*=\s*(\{[\s\S]*?\});?/);
     if (!match) return null;
-    const objStr = match[2].replace(/(\w+):/g, '"$1":');
+    let objStr = match[2];
+
+    // 2) Chuẩn hóa JS object -> JSON: key: -> "key":
+    objStr = objStr.replace(/(\w+)\s*:/g, '"$1":');
+
     let data;
     try {
       data = JSON.parse(objStr);
     } catch {
+      console.warn("[Minh Ngọc]", region, "JSON.parse lỗi");
       return null;
     }
-    if (data.run === 1 && data.result) {
-      // TODO: khi Minh Ngọc trả về số giải (data.result), parse thành draws ở đây
-      return null;
+
+    // 3) Giả định Minh Ngọc có mảng data.kq (hoặc data.issues) chứa các kỳ quay
+    const rawIssues = Array.isArray(data.kq || data.issues) ? (data.kq || data.issues) : [];
+    if (rawIssues.length === 0) return [];
+
+    const draws = [];
+
+    for (const issue of rawIssues) {
+      // Ngày quay: ưu tiên issue.date, fallback issue.turnNum
+      const drawDate = parseVNDateToYMD(issue.date || issue.turnNum);
+      if (!drawDate) continue;
+
+      // Mã station: tùy Minh Ngọc trả gì (station, code, stationCode, ...)
+      const stationKey = String(
+        issue.station || issue.stationCode || issue.code || ""
+      ).toLowerCase();
+
+      const map = MINH_NGOC_STATION_TO_REGION_PROVINCE[stationKey];
+
+      let regionCode;
+      let provinceCode;
+
+      if (map) {
+        [regionCode, provinceCode] = map;
+      } else if (region === "mb") {
+        // Miền Bắc: nếu không có station rõ, xử lý giống xoso188: suy ra tỉnh từ ngày
+        regionCode = "MB";
+        const dmy = drawDate.split("-").reverse().join("/"); // YYYY-MM-DD -> DD/MM/YYYY
+        const stationName = getStationNameMB(dmy);
+        provinceCode = MB_NAME_TO_CODE[stationName] || "HN";
+      } else {
+        // Không map được station -> bỏ qua để tránh ghi sai DB
+        continue;
+      }
+
+      // Giả định Minh Ngọc có field detail giống xoso188 (mảng JSON DB..G8)
+      const detailStr = issue.detail || issue.kq_detail || "";
+      const results = parseDetail(detailStr);
+      if (!results.length) continue;
+
+      draws.push({
+        draw_date: drawDate,       // "YYYY-MM-DD"
+        province_code: provinceCode,
+        region_code: regionCode,   // "MN" | "MT" | "MB"
+        results,
+      });
     }
-    return null;
+
+    return draws;
   } catch (err) {
     console.warn("[Minh Ngọc]", region, err.message);
     return null;
@@ -375,16 +493,24 @@ async function checkAndBackfillToday(pool, importLotteryResults) {
     "→ kiểm tra",
     datesToCheck.join(", ")
   );
+  const REQUIRED_REGIONS = ["MN", "MT", "MB"];
   try {
     for (const drawDate of datesToCheck) {
-      const { rows } = await pool.query(
-        "SELECT COUNT(*) AS c FROM lottery_draws WHERE draw_date = $1::date",
+      const { rows: regionRows } = await pool.query(
+        `SELECT r.code FROM lottery_draws d
+         JOIN regions r ON d.region_id = r.id
+         WHERE d.draw_date = $1::date`,
         [drawDate]
       );
-      const count = parseInt(rows[0]?.c ?? 0, 10);
-      if (count > 0) {
-        console.log("[LotterySync] 20h check:", drawDate, "đã có", count, "bản ghi → bỏ qua");
+      const presentCodes = regionRows.map((r) => r.code);
+      const hasAllRegions = REQUIRED_REGIONS.every((c) => presentCodes.includes(c));
+      if (hasAllRegions) {
+        console.log("[LotterySync] 20h check:", drawDate, "đã đủ MN, MT, MB → bỏ qua");
         continue;
+      }
+      const missing = REQUIRED_REGIONS.filter((c) => !presentCodes.includes(c));
+      if (missing.length) {
+        console.log("[LotterySync] 20h check:", drawDate, "thiếu miền:", missing.join(", "));
       }
       console.log("[LotterySync] 20h backfill: bắt đầu gọi xoso188 cho MN, MT, MB (draw_date=" + drawDate + ")");
       const allDraws = [];
@@ -431,7 +557,19 @@ async function pollUntilResult(region, pool, importLotteryResults) {
     if (Date.now() - start > maxPollDurationMs) {
       clearInterval(pollIntervals[region]);
       pollIntervals[region] = null;
-      console.warn(`[LotterySync] ${label}: hết khung giờ xổ, ngưng poll`);
+      console.warn(`[LotterySync] ${label}: hết khung giờ xổ, ngưng poll → gọi xoso188 lần cuối`);
+      try {
+        const draws = await fetchXoso188ForRegion(region, today);
+        const forToday = draws.filter((d) => d.draw_date === today);
+        if (forToday.length > 0) {
+          const result = await importLotteryResults({ draws: forToday });
+          console.log(`[LotterySync] ${label}: fallback xoso188 sau khi hết giờ poll đã lưu:`, result);
+        } else {
+          console.warn(`[LotterySync] ${label}: xoso188 cũng không trả kết quả cho ${today}`);
+        }
+      } catch (err) {
+        console.warn(`[LotterySync] ${label}: fallback xoso188 lỗi:`, err.message);
+      }
       return;
     }
 
