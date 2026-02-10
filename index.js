@@ -3,6 +3,7 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import path from "path";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import * as db from "./db/index.js";
 import { XOSO188_HEADERS, pingXoso188, triggerRegionSync } from "./db/lotterySync.js";
@@ -13,26 +14,114 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
+const memCache = new Map();
+function cacheGet(k) {
+  const v = memCache.get(k);
+  if (!v) return null;
+  if (Date.now() > v.exp) { memCache.delete(k); return null; }
+  return v.value;
+}
+function cacheSet(k, value, ttlMs) {
+  memCache.set(k, { exp: Date.now() + ttlMs, value });
+}
+
+function sha256Hex(str) {
+  return crypto.createHash("sha256").update(String(str)).digest("hex");
+}
+
+function floorToMinute(date = new Date()) {
+  const d = new Date(date);
+  d.setSeconds(0, 0);
+  return d;
+}
+
+async function verifyApiKeyAndRateLimit(pool, rawKey) {
+  if (!rawKey) return { ok: false, status: 403, message: "Missing x-gi8-key" };
+
+  const keyHash = sha256Hex(rawKey);
+
+  // 1) verify
+  const k = await pool.query(
+    `SELECT id, is_active, rate_per_min
+     FROM api_keys
+     WHERE key_hash = $1
+     LIMIT 1`,
+    [keyHash]
+  );
+
+  if (!k.rowCount) return { ok: false, status: 403, message: "Invalid x-gi8-key" };
+  const row = k.rows[0];
+  if (!row.is_active) return { ok: false, status: 403, message: "API key revoked" };
+
+  // 2) rate limit (bucket theo phút)
+  const bucket = floorToMinute(new Date());
+  const up = await pool.query(
+    `INSERT INTO api_key_usage_minute (api_key_id, bucket_start, count)
+     VALUES ($1, $2, 1)
+     ON CONFLICT (api_key_id, bucket_start)
+     DO UPDATE SET count = api_key_usage_minute.count + 1
+     RETURNING count`,
+    [row.id, bucket]
+  );
+
+  const used = up.rows[0].count;
+  if (used > row.rate_per_min) {
+    return { ok: false, status: 429, message: "Rate limit exceeded" };
+  }
+
+  return { ok: true, apiKeyId: row.id, used, ratePerMin: row.rate_per_min };
+}
+
 // ====================== 🔐 GI8 INTERNAL KEY GUARD ======================
-app.use((req, res, next) => {
+// app.use((req, res, next) => {
+//   const pathNorm = req.path.replace(/\/$/, "") || "/";
+//   // Cho phép health check, lottery DB read, lottery import (GitHub Actions / script gửi POST + x-gi8-key)
+//   if (pathNorm === "/health") return next();
+//   if (pathNorm.startsWith("/api/lottery/db/")) return next();
+//   if (pathNorm === "/api/lottery/sync-test") return next();
+//   if (pathNorm === "/api/lottery/ping-xoso188") return next();
+//   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
+
+//   const key = req.headers["x-gi8-key"];
+
+//   if (!key || key !== process.env.GI8_INTERNAL_KEY) {
+//     return res.status(403).json({
+//       error: "Forbidden",
+//       message: "Missing or invalid x-gi8-key",
+//     });
+//   }
+
+//   next();
+// });
+app.use(async (req, res, next) => {
   const pathNorm = req.path.replace(/\/$/, "") || "/";
-  // Cho phép health check, lottery DB read, lottery import (GitHub Actions / script gửi POST + x-gi8-key)
+
+  // whitelist như cũ
   if (pathNorm === "/health") return next();
   if (pathNorm.startsWith("/api/lottery/db/")) return next();
   if (pathNorm === "/api/lottery/sync-test") return next();
   if (pathNorm === "/api/lottery/ping-xoso188") return next();
   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
 
-  const key = req.headers["x-gi8-key"];
-
-  if (!key || key !== process.env.GI8_INTERNAL_KEY) {
-    return res.status(403).json({
-      error: "Forbidden",
-      message: "Missing or invalid x-gi8-key",
-    });
+  // cần DB để auth
+  if (!db.pool) {
+    return res.status(503).json({ error: "DB not ready" });
   }
 
-  next();
+  const key = req.headers["x-gi8-key"];
+
+  try {
+    const r = await verifyApiKeyAndRateLimit(db.pool, key);
+    if (!r.ok) {
+      return res.status(r.status).json({ error: "Forbidden", message: r.message });
+    }
+
+    // optional attach để debug
+    req.gi8 = r;
+    return next();
+  } catch (e) {
+    return res.status(500).json({ error: "Auth error", message: e.message });
+  }
 });
 
 // ====================== SERVE FRONTEND (/public) ======================
@@ -198,11 +287,23 @@ app.post("/api/lottery/import", async (req, res) => {
     return res.status(503).json({ error: "DB not configured", message: "DATABASE_URL not set" });
   }
   try {
+    const cacheKey = `history:${req.query.gameCode}:${req.query.limitNum || "200"}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return res.json(cached);
     const { draws } = req.body;
     if (!Array.isArray(draws) || draws.length === 0) {
       return res.status(400).json({ error: "Invalid payload", message: "draws array required" });
     }
     const result = await db.importLotteryResults(req.body);
+    const payload = {
+      success: true,
+      msg: "ok",
+      code: 0,
+      t,
+    };
+    
+    cacheSet(cacheKey, payload, 60_000);
+    return res.json(payload);
     return res.json({ ok: true, ...result });
   } catch (err) {
     console.error("Import error:", err);
