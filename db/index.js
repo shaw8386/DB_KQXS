@@ -53,23 +53,20 @@ INSERT INTO regions (id, code, name) VALUES (1, 'MB', 'Miền Bắc'), (2, 'MT',
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE IF NOT EXISTS api_keys (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  name          text NOT NULL,
-  key_hash      text NOT NULL UNIQUE,
-  is_active     boolean NOT NULL DEFAULT true,
-  rate_per_min  int NOT NULL DEFAULT 60,
+CREATE TABLE IF NOT EXISTS auth_accept (
+  id            bigserial PRIMARY KEY,
+  client_id     text NOT NULL,
+  api_key       text NOT NULL UNIQUE,
+  ip_address    text,
+  user_agent    text,
+  scopes        text,
   created_at    timestamptz NOT NULL DEFAULT now(),
-  revoked_at    timestamptz
+  last_used_at  timestamptz,
+  is_active     boolean NOT NULL DEFAULT true
 );
 
-CREATE TABLE IF NOT EXISTS api_key_usage_minute (
-  api_key_id    uuid NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
-  bucket_start  timestamptz NOT NULL,
-  count         int NOT NULL DEFAULT 0,
-  PRIMARY KEY (api_key_id, bucket_start)
-);
-
+CREATE INDEX IF NOT EXISTS idx_auth_accept_active ON auth_accept(is_active);
+CREATE INDEX IF NOT EXISTS idx_auth_accept_client ON auth_accept(client_id);
 `;
 
 const PROVINCES_SEED_SQL = `
