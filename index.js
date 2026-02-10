@@ -93,36 +93,70 @@ async function verifyApiKeyAndRateLimit(pool, rawKey) {
 
 //   next();
 // });
+// ====================== 🔐 AUTH_ACCEPT GUARD (DB) ======================
 app.use(async (req, res, next) => {
   const pathNorm = req.path.replace(/\/$/, "") || "/";
 
-  // whitelist như cũ
+  // whitelist y như bạn đang dùng
   if (pathNorm === "/health") return next();
   if (pathNorm.startsWith("/api/lottery/db/")) return next();
   if (pathNorm === "/api/lottery/sync-test") return next();
   if (pathNorm === "/api/lottery/ping-xoso188") return next();
   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
 
-  // cần DB để auth
   if (!db.pool) {
-    return res.status(503).json({ error: "DB not ready" });
+    return res.status(503).json({ error: "DB not ready", message: "DATABASE_URL not set or init failed" });
   }
 
   const key = req.headers["x-gi8-key"];
+  if (!key) {
+    return res.status(403).json({ error: "Forbidden", message: "Missing x-gi8-key" });
+  }
 
   try {
-    const r = await verifyApiKeyAndRateLimit(db.pool, key);
-    if (!r.ok) {
-      return res.status(r.status).json({ error: "Forbidden", message: r.message });
+    const ip =
+      req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+      req.socket?.remoteAddress ||
+      null;
+
+    const ua = req.headers["user-agent"] || null;
+
+    // verify key
+    const { rows } = await db.pool.query(
+      `SELECT id, client_id, scopes, is_active
+       FROM auth_accept
+       WHERE api_key = $1
+       LIMIT 1`,
+      [key]
+    );
+
+    if (!rows.length) {
+      return res.status(403).json({ error: "Forbidden", message: "Invalid x-gi8-key" });
+    }
+    const auth = rows[0];
+    if (!auth.is_active) {
+      return res.status(403).json({ error: "Forbidden", message: "Key is inactive" });
     }
 
-    // optional attach để debug
-    req.gi8 = r;
+    // update last_used_at (+ lưu ip/ua lần gần nhất nếu bạn muốn)
+    await db.pool.query(
+      `UPDATE auth_accept
+       SET last_used_at = now(),
+           ip_address = COALESCE($2, ip_address),
+           user_agent = COALESCE($3, user_agent)
+       WHERE id = $1`,
+      [auth.id, ip, ua]
+    );
+
+    // attach info để dùng nếu cần
+    req.gi8 = { auth_id: auth.id, client_id: auth.client_id, scopes: auth.scopes };
+
     return next();
   } catch (e) {
     return res.status(500).json({ error: "Auth error", message: e.message });
   }
 });
+
 
 // ====================== SERVE FRONTEND (/public) ======================
 const __filename = fileURLToPath(import.meta.url);
