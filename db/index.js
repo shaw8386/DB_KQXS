@@ -50,6 +50,26 @@ CREATE INDEX IF NOT EXISTS idx_lottery_draws_province ON lottery_draws(province_
 CREATE INDEX IF NOT EXISTS idx_lottery_draws_region ON lottery_draws(region_id);
 CREATE INDEX IF NOT EXISTS idx_lottery_results_draw ON lottery_results(draw_id);
 INSERT INTO regions (id, code, name) VALUES (1, 'MB', 'Miền Bắc'), (2, 'MT', 'Miền Trung'), (3, 'MN', 'Miền Nam') ON CONFLICT (code) DO NOTHING;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL,
+  key_hash      text NOT NULL UNIQUE,
+  is_active     boolean NOT NULL DEFAULT true,
+  rate_per_min  int NOT NULL DEFAULT 60,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  revoked_at    timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS api_key_usage_minute (
+  api_key_id    uuid NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+  bucket_start  timestamptz NOT NULL,
+  count         int NOT NULL DEFAULT 0,
+  PRIMARY KEY (api_key_id, bucket_start)
+);
+
 `;
 
 const PROVINCES_SEED_SQL = `
