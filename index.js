@@ -3,7 +3,6 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import path from "path";
-import crypto from "crypto";
 import { fileURLToPath } from "url";
 import * as db from "./db/index.js";
 import { XOSO188_HEADERS, pingXoso188, triggerRegionSync } from "./db/lotterySync.js";
@@ -14,100 +13,46 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-const memCache = new Map();
+// ====================== SIMPLE IN-MEM CACHE ======================
+const memCache = new Map(); // key -> { exp, value }
 function cacheGet(k) {
   const v = memCache.get(k);
   if (!v) return null;
-  if (Date.now() > v.exp) { memCache.delete(k); return null; }
+  if (Date.now() > v.exp) {
+    memCache.delete(k);
+    return null;
+  }
   return v.value;
 }
 function cacheSet(k, value, ttlMs) {
   memCache.set(k, { exp: Date.now() + ttlMs, value });
 }
 
-function sha256Hex(str) {
-  return crypto.createHash("sha256").update(String(str)).digest("hex");
-}
-
-function floorToMinute(date = new Date()) {
-  const d = new Date(date);
-  d.setSeconds(0, 0);
-  return d;
-}
-
-async function verifyApiKeyAndRateLimit(pool, rawKey) {
-  if (!rawKey) return { ok: false, status: 403, message: "Missing x-gi8-key" };
-
-  const keyHash = sha256Hex(rawKey);
-
-  // 1) verify
-  const k = await pool.query(
-    `SELECT id, is_active, rate_per_min
-     FROM api_keys
-     WHERE key_hash = $1
-     LIMIT 1`,
-    [keyHash]
-  );
-
-  if (!k.rowCount) return { ok: false, status: 403, message: "Invalid x-gi8-key" };
-  const row = k.rows[0];
-  if (!row.is_active) return { ok: false, status: 403, message: "API key revoked" };
-
-  // 2) rate limit (bucket theo phút)
-  const bucket = floorToMinute(new Date());
-  const up = await pool.query(
-    `INSERT INTO api_key_usage_minute (api_key_id, bucket_start, count)
-     VALUES ($1, $2, 1)
-     ON CONFLICT (api_key_id, bucket_start)
-     DO UPDATE SET count = api_key_usage_minute.count + 1
-     RETURNING count`,
-    [row.id, bucket]
-  );
-
-  const used = up.rows[0].count;
-  if (used > row.rate_per_min) {
-    return { ok: false, status: 429, message: "Rate limit exceeded" };
-  }
-
-  return { ok: true, apiKeyId: row.id, used, ratePerMin: row.rate_per_min };
-}
-
-// ====================== 🔐 GI8 INTERNAL KEY GUARD ======================
-// app.use((req, res, next) => {
-//   const pathNorm = req.path.replace(/\/$/, "") || "/";
-//   // Cho phép health check, lottery DB read, lottery import (GitHub Actions / script gửi POST + x-gi8-key)
-//   if (pathNorm === "/health") return next();
-//   if (pathNorm.startsWith("/api/lottery/db/")) return next();
-//   if (pathNorm === "/api/lottery/sync-test") return next();
-//   if (pathNorm === "/api/lottery/ping-xoso188") return next();
-//   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
-
-//   const key = req.headers["x-gi8-key"];
-
-//   if (!key || key !== process.env.GI8_INTERNAL_KEY) {
-//     return res.status(403).json({
-//       error: "Forbidden",
-//       message: "Missing or invalid x-gi8-key",
-//     });
-//   }
-
-//   next();
-// });
 // ====================== 🔐 AUTH_ACCEPT GUARD (DB) ======================
+// - Verify bằng auth_accept.api_key
+// - Update last_used_at (+ ip/user_agent nếu chưa có) trong 1 query
 app.use(async (req, res, next) => {
   const pathNorm = req.path.replace(/\/$/, "") || "/";
 
-  // whitelist y như bạn đang dùng
+  // ===== WHITELIST (public / không cần key) =====
   if (pathNorm === "/health") return next();
   if (pathNorm.startsWith("/api/lottery/db/")) return next();
   if (pathNorm === "/api/lottery/sync-test") return next();
   if (pathNorm === "/api/lottery/ping-xoso188") return next();
+
+  // Import (POST) vẫn yêu cầu key? => Nếu bạn muốn import cũng cần key thì BỎ whitelist này.
+  // Hiện tại giữ đúng như code cũ của bạn: import được whitelist qua guard.
   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
 
+  // ===== REQUIRE DB =====
   if (!db.pool) {
-    return res.status(503).json({ error: "DB not ready", message: "DATABASE_URL not set or init failed" });
+    return res.status(503).json({
+      error: "DB not ready",
+      message: "DATABASE_URL not set or init failed",
+    });
   }
 
+  // ===== REQUIRE KEY =====
   const key = req.headers["x-gi8-key"];
   if (!key) {
     return res.status(403).json({ error: "Forbidden", message: "Missing x-gi8-key" });
@@ -121,35 +66,28 @@ app.use(async (req, res, next) => {
 
     const ua = req.headers["user-agent"] || null;
 
-    // verify key
+    // 1 query: verify + touch last_used
     const { rows } = await db.pool.query(
-      `SELECT id, client_id, scopes, is_active
-       FROM auth_accept
-       WHERE api_key = $1
-       LIMIT 1`,
-      [key]
+      `UPDATE auth_accept
+       SET last_used_at = now(),
+           ip_address   = COALESCE($2, ip_address),
+           user_agent   = COALESCE($3, user_agent)
+       WHERE api_key = $1 AND is_active = true
+       RETURNING id, client_id, scopes`,
+      [key, ip, ua]
     );
 
     if (!rows.length) {
-      return res.status(403).json({ error: "Forbidden", message: "Invalid x-gi8-key" });
-    }
-    const auth = rows[0];
-    if (!auth.is_active) {
-      return res.status(403).json({ error: "Forbidden", message: "Key is inactive" });
+      return res
+        .status(403)
+        .json({ error: "Forbidden", message: "Invalid or inactive x-gi8-key" });
     }
 
-    // update last_used_at (+ lưu ip/ua lần gần nhất nếu bạn muốn)
-    await db.pool.query(
-      `UPDATE auth_accept
-       SET last_used_at = now(),
-           ip_address = COALESCE($2, ip_address),
-           user_agent = COALESCE($3, user_agent)
-       WHERE id = $1`,
-      [auth.id, ip, ua]
-    );
-
-    // attach info để dùng nếu cần
-    req.gi8 = { auth_id: auth.id, client_id: auth.client_id, scopes: auth.scopes };
+    req.gi8 = {
+      auth_id: rows[0].id,
+      client_id: rows[0].client_id,
+      scopes: rows[0].scopes,
+    };
 
     return next();
   } catch (e) {
@@ -157,15 +95,12 @@ app.use(async (req, res, next) => {
   }
 });
 
-
 // ====================== SERVE FRONTEND (/public) ======================
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, "public")));
 
 // ====================== PROXY: /api/* -> DB hoặc https://xoso188.net/api/* ======================
-// API đích: GET /api/front/open/lottery/history/list/game?limitNum=200&gameCode=xxx
-// Trả từ DB với format chuẩn { success, msg, code, t: { turnNum, openTime, serverTime, name, code, sort, navCate, issueList } }
 const TARGET_BASE = "https://xoso188.net";
 
 function formatDrawDate(d) {
@@ -175,14 +110,23 @@ function formatDrawDate(d) {
   return { turnNum: `${day}/${month}/${year}`, ymd: `${year}-${month}-${day}` };
 }
 
-app.use("/api", async (req, res, next) => {
+app.use("/api", async (req, res) => {
   const match = req.path.match(/^\/front\/open\/lottery\/history\/list\/game/);
+
+  // ======================
+  // DB READ (HOT PATH): /api/front/open/lottery/history/list/game
+  // ======================
   if (match && req.method === "GET" && req.query.gameCode && db.pool) {
+    const gameCode = String(req.query.gameCode);
+    const limitNum = String(req.query.limitNum || "200");
+
+    // cache 30s–60s tuỳ bạn
+    const cacheKey = `history:${gameCode}:${limitNum}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return res.json(cached);
+
     try {
-      const data = await db.getLotteryHistoryListGame(
-        req.query.gameCode,
-        req.query.limitNum || "200"
-      );
+      const data = await db.getLotteryHistoryListGame(gameCode, limitNum);
       if (!data) {
         return res.status(400).json({
           success: false,
@@ -190,25 +134,44 @@ app.use("/api", async (req, res, next) => {
           code: 400,
         });
       }
+
       const now = new Date();
       const serverTime =
-        `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ` +
-        `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+        `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+          now.getDate()
+        ).padStart(2, "0")} ` +
+        `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(
+          2,
+          "0"
+        )}:${String(now.getSeconds()).padStart(2, "0")}`;
 
       const issueList = [];
       for (const draw of data.draws) {
         const groups = ["", "", "", "", "", "", "", "", ""];
-        const prizeMap = { DB: 0, G1: 1, G2: 2, G3: 3, G4: 4, G5: 5, G6: 6, G7: 7, G8: 8 };
+        const prizeMap = {
+          DB: 0,
+          G1: 1,
+          G2: 2,
+          G3: 3,
+          G4: 4,
+          G5: 5,
+          G6: 6,
+          G7: 7,
+          G8: 8,
+        };
+
         for (const r of draw.results) {
           const idx = prizeMap[r.prize_code];
           if (idx !== undefined) {
             groups[idx] = groups[idx] ? groups[idx] + "," + r.result_number : r.result_number;
           }
         }
+
         const { turnNum, ymd } = formatDrawDate(draw.draw_date);
         const openTime = `${ymd} ${data.openTimeByRegion}`;
         const openTimeStamp = new Date(openTime).getTime();
         const openNum = groups[0] || ""; // giải đặc biệt
+
         issueList.push({
           turnNum,
           openNum,
@@ -225,11 +188,10 @@ app.use("/api", async (req, res, next) => {
       const latestTurn = data.draws.length
         ? formatDrawDate(data.draws[0].draw_date)
         : { turnNum: "", ymd: "" };
+
       const t = {
         turnNum: latestTurn.turnNum,
-        openTime: data.draws.length
-          ? `${latestTurn.ymd} ${data.openTimeByRegion}`
-          : "",
+        openTime: data.draws.length ? `${latestTurn.ymd} ${data.openTimeByRegion}` : "",
         serverTime,
         name: data.name,
         code: data.code,
@@ -238,12 +200,10 @@ app.use("/api", async (req, res, next) => {
         issueList,
       };
 
-      return res.json({
-        success: true,
-        msg: "ok",
-        code: 0,
-        t,
-      });
+      const payload = { success: true, msg: "ok", code: 0, t };
+
+      cacheSet(cacheKey, payload, 60_000); // 60s
+      return res.json(payload);
     } catch (e) {
       console.warn("DB history/list/game error:", e.message);
       return res.status(500).json({
@@ -253,7 +213,10 @@ app.use("/api", async (req, res, next) => {
       });
     }
   }
-  // Proxy to xoso188 (header chuẩn giống Python để không bị chặn)
+
+  // ======================
+  // FALLBACK PROXY TO xoso188
+  // ======================
   const targetUrl = TARGET_BASE + req.originalUrl;
   try {
     const response = await fetch(targetUrl, {
@@ -275,14 +238,13 @@ app.use("/api", async (req, res, next) => {
 app.get("/health", (_, res) => res.send("✅ Railway Lottery Proxy Running"));
 
 // ====================== LOTTERY FETCH (proxy xoso188) ======================
-// Header chuẩn giống tools/fetch_lottery_and_upload.py để xoso188 không chặn
-// GET /api/lottery/fetch?gameCode=xxx&limit=200 - Fetch từ xoso188 qua backend
+// GET /api/lottery/fetch?gameCode=xxx&limit=200
 app.get("/api/lottery/fetch", async (req, res) => {
   const gameCode = req.query.gameCode;
   const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 500);
-  if (!gameCode) {
-    return res.status(400).json({ error: "Missing gameCode" });
-  }
+
+  if (!gameCode) return res.status(400).json({ error: "Missing gameCode" });
+
   const targetUrl = `https://xoso188.net/api/front/open/lottery/history/list/game?limitNum=${limit}&gameCode=${gameCode}`;
   try {
     const response = await fetch(targetUrl, {
@@ -298,7 +260,7 @@ app.get("/api/lottery/fetch", async (req, res) => {
   }
 });
 
-// GET /api/lottery/ping-xoso188 - Test Railway có gọi được link phụ xoso188 không (không cần key)
+// GET /api/lottery/ping-xoso188 (public)
 app.get("/api/lottery/ping-xoso188", async (req, res) => {
   try {
     const result = await pingXoso188();
@@ -315,29 +277,22 @@ app.get("/api/lottery/ping-xoso188", async (req, res) => {
 });
 
 // ====================== LOTTERY DB ======================
-// POST /api/lottery/import - Nhận dữ liệu từ Python script (cần x-gi8-key)
+// POST /api/lottery/import
 app.post("/api/lottery/import", async (req, res) => {
   if (!db.pool) {
     return res.status(503).json({ error: "DB not configured", message: "DATABASE_URL not set" });
   }
   try {
-    const cacheKey = `history:${req.query.gameCode}:${req.query.limitNum || "200"}`;
-    const cached = cacheGet(cacheKey);
-    if (cached) return res.json(cached);
     const { draws } = req.body;
     if (!Array.isArray(draws) || draws.length === 0) {
       return res.status(400).json({ error: "Invalid payload", message: "draws array required" });
     }
+
     const result = await db.importLotteryResults(req.body);
-    const payload = {
-      success: true,
-      msg: "ok",
-      code: 0,
-      t,
-    };
-    
-    cacheSet(cacheKey, payload, 60_000);
-    return res.json(payload);
+
+    // DB đã đổi => clear cache để list/game phản ánh ngay
+    memCache.clear();
+
     return res.json({ ok: true, ...result });
   } catch (err) {
     console.error("Import error:", err);
@@ -345,7 +300,7 @@ app.post("/api/lottery/import", async (req, res) => {
   }
 });
 
-// GET /api/lottery/sync-test?region=mn|mt|mb - Test link phụ xoso188 (không cần key)
+// GET /api/lottery/sync-test?region=mn|mt|mb (public)
 app.get("/api/lottery/sync-test", async (req, res) => {
   try {
     const { runSyncTest } = await import("./db/lotterySync.js");
@@ -357,8 +312,7 @@ app.get("/api/lottery/sync-test", async (req, res) => {
   }
 });
 
-// GET /api/lottery/trigger-sync?region=mn|mt|mb - Gọi sync theo lịch (cần x-gi8-key).
-// Dùng khi cron trong process không chạy (Railway sleep): cron ngoài gọi đúng giờ 16:13 / 17:13 / 18:13 VN.
+// GET /api/lottery/trigger-sync?region=mn|mt|mb (requires key by guard)
 app.get("/api/lottery/trigger-sync", (req, res) => {
   if (!db.pool) {
     return res.status(503).json({ success: false, msg: "DB chưa sẵn sàng", code: 503 });
@@ -377,24 +331,22 @@ app.get("/api/lottery/trigger-sync", (req, res) => {
   });
 });
 
-// GET /api/lottery/db/draws?date=DD/MM/YYYY&region=MB|MT|MN - Lấy kết quả theo ngày
+// GET /api/lottery/db/draws?date=DD/MM/YYYY&region=MB|MT|MN (public by whitelist)
 app.get("/api/lottery/db/draws", async (req, res) => {
-  if (!db.pool) {
-    return res.status(503).json({ error: "DB not configured" });
-  }
+  if (!db.pool) return res.status(503).json({ error: "DB not configured" });
   try {
     const dateStr = req.query.date;
     const region = req.query.region || null;
-    if (!dateStr) {
-      return res.status(400).json({ error: "Missing date (DD/MM/YYYY)" });
-    }
+    if (!dateStr) return res.status(400).json({ error: "Missing date (DD/MM/YYYY)" });
+
     const [d, m, y] = dateStr.split(/[\/\-]/).map(Number);
     const drawDate = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+
     const draws = await db.getDrawsByDate(drawDate, region);
     const withResults = await Promise.all(
-      draws.map(async (d) => {
-        const results = await db.getResultsByDrawId(d.id);
-        return { ...d, results };
+      draws.map(async (dr) => {
+        const results = await db.getResultsByDrawId(dr.id);
+        return { ...dr, results };
       })
     );
     return res.json({ draws: withResults });
@@ -404,14 +356,13 @@ app.get("/api/lottery/db/draws", async (req, res) => {
   }
 });
 
-// GET /api/lottery/db/history/:gameCode?limit=200 - Format giống xoso188 cho frontend
+// GET /api/lottery/db/history/:gameCode?limit=200 (public by whitelist)
 app.get("/api/lottery/db/history/:gameCode", async (req, res) => {
-  if (!db.pool) {
-    return res.status(503).json({ error: "DB not configured" });
-  }
+  if (!db.pool) return res.status(503).json({ error: "DB not configured" });
   try {
     const gameCode = req.params.gameCode;
     const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 500);
+
     const { rows } = await db.pool.query(
       `SELECT d.draw_date, d.id as draw_id, p.api_game_code, p.code as province_code, r.code as region_code
        FROM lottery_draws d
@@ -422,21 +373,24 @@ app.get("/api/lottery/db/history/:gameCode", async (req, res) => {
        LIMIT $2`,
       [gameCode, limit]
     );
+
     const issueList = [];
     for (const row of rows) {
       const resRows = await db.getResultsByDrawId(row.draw_id);
       const groups = ["", "", "", "", "", "", "", "", ""];
       const prizeMap = { DB: 0, G1: 1, G2: 2, G3: 3, G4: 4, G5: 5, G6: 6, G7: 7, G8: 8 };
+
       for (const r of resRows) {
         const idx = prizeMap[r.prize_code];
         if (idx !== undefined) {
-          if (groups[idx]) groups[idx] += "," + r.result_number;
-          else groups[idx] = r.result_number;
+          groups[idx] = groups[idx] ? groups[idx] + "," + r.result_number : r.result_number;
         }
       }
+
       const turnNum = row.draw_date.toISOString().slice(0, 10).split("-").reverse().join("/");
       issueList.push({ turnNum, detail: JSON.stringify(groups) });
     }
+
     return res.json({ t: { issueList } });
   } catch (err) {
     console.error("History error:", err);
@@ -445,21 +399,498 @@ app.get("/api/lottery/db/history/:gameCode", async (req, res) => {
 });
 
 // ====================== START ======================
-// Server listen ngay để Railway không timeout (502); DB init chạy sau
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("🚀 Server chạy port", PORT);
+
   db
     .initDb()
     .then(async (pool) => {
       if (pool) {
         db.scheduleLotterySync(pool, db.importLotteryResults);
-        console.log("[Startup] LotterySync: cron nội bộ đã đăng ký. Nếu Railway sleep lúc 16:13/17:13/18:13 VN, hãy dùng cron ngoài gọi GET /api/lottery/trigger-sync?region=mn|mt|mb với header x-gi8-key.");
+        console.log(
+          "[Startup] LotterySync: cron nội bộ đã đăng ký. Nếu Railway sleep lúc 16:13/17:13/18:13 VN, hãy dùng cron ngoài gọi GET /api/lottery/trigger-sync?region=mn|mt|mb với header x-gi8-key."
+        );
       } else {
-        console.warn("[Startup] DB init trả null → không chạy scheduleLotterySync. Kiểm tra DATABASE_URL và log lỗi phía trên.");
+        console.warn(
+          "[Startup] DB init trả null → không chạy scheduleLotterySync. Kiểm tra DATABASE_URL và log lỗi phía trên."
+        );
       }
+
       const ping = await pingXoso188();
-      console.log("[Startup] xoso188:", ping.ok ? "OK (count=" + ping.count + ")" : "FAIL", ping.message || "");
+      console.log(
+        "[Startup] xoso188:",
+        ping.ok ? "OK (count=" + ping.count + ")" : "FAIL",
+        ping.message || ""
+      );
     })
     .catch((e) => console.warn("DB init:", e.message));
 });
+
+
+
+/////////////////////////////// // ====================== IMPORTS ======================
+// import express from "express";
+// import fetch from "node-fetch";
+// import cors from "cors";
+// import path from "path";
+// import crypto from "crypto";
+// import { fileURLToPath } from "url";
+// import * as db from "./db/index.js";
+// import { XOSO188_HEADERS, pingXoso188, triggerRegionSync } from "./db/lotterySync.js";
+
+// process.env.TZ = "Asia/Ho_Chi_Minh";
+
+// const app = express();
+// app.use(cors());
+// app.use(express.json({ limit: "10mb" }));
+
+// const memCache = new Map();
+// function cacheGet(k) {
+//   const v = memCache.get(k);
+//   if (!v) return null;
+//   if (Date.now() > v.exp) { memCache.delete(k); return null; }
+//   return v.value;
+// }
+// function cacheSet(k, value, ttlMs) {
+//   memCache.set(k, { exp: Date.now() + ttlMs, value });
+// }
+
+// function sha256Hex(str) {
+//   return crypto.createHash("sha256").update(String(str)).digest("hex");
+// }
+
+// function floorToMinute(date = new Date()) {
+//   const d = new Date(date);
+//   d.setSeconds(0, 0);
+//   return d;
+// }
+
+// async function verifyApiKeyAndRateLimit(pool, rawKey) {
+//   if (!rawKey) return { ok: false, status: 403, message: "Missing x-gi8-key" };
+
+//   const keyHash = sha256Hex(rawKey);
+
+//   // 1) verify
+//   const k = await pool.query(
+//     `SELECT id, is_active, rate_per_min
+//      FROM api_keys
+//      WHERE key_hash = $1
+//      LIMIT 1`,
+//     [keyHash]
+//   );
+
+//   if (!k.rowCount) return { ok: false, status: 403, message: "Invalid x-gi8-key" };
+//   const row = k.rows[0];
+//   if (!row.is_active) return { ok: false, status: 403, message: "API key revoked" };
+
+//   // 2) rate limit (bucket theo phút)
+//   const bucket = floorToMinute(new Date());
+//   const up = await pool.query(
+//     `INSERT INTO api_key_usage_minute (api_key_id, bucket_start, count)
+//      VALUES ($1, $2, 1)
+//      ON CONFLICT (api_key_id, bucket_start)
+//      DO UPDATE SET count = api_key_usage_minute.count + 1
+//      RETURNING count`,
+//     [row.id, bucket]
+//   );
+
+//   const used = up.rows[0].count;
+//   if (used > row.rate_per_min) {
+//     return { ok: false, status: 429, message: "Rate limit exceeded" };
+//   }
+
+//   return { ok: true, apiKeyId: row.id, used, ratePerMin: row.rate_per_min };
+// }
+
+// // ====================== 🔐 GI8 INTERNAL KEY GUARD ======================
+// // app.use((req, res, next) => {
+// //   const pathNorm = req.path.replace(/\/$/, "") || "/";
+// //   // Cho phép health check, lottery DB read, lottery import (GitHub Actions / script gửi POST + x-gi8-key)
+// //   if (pathNorm === "/health") return next();
+// //   if (pathNorm.startsWith("/api/lottery/db/")) return next();
+// //   if (pathNorm === "/api/lottery/sync-test") return next();
+// //   if (pathNorm === "/api/lottery/ping-xoso188") return next();
+// //   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
+
+// //   const key = req.headers["x-gi8-key"];
+
+// //   if (!key || key !== process.env.GI8_INTERNAL_KEY) {
+// //     return res.status(403).json({
+// //       error: "Forbidden",
+// //       message: "Missing or invalid x-gi8-key",
+// //     });
+// //   }
+
+// //   next();
+// // });
+// // ====================== 🔐 AUTH_ACCEPT GUARD (DB) ======================
+// app.use(async (req, res, next) => {
+//   const pathNorm = req.path.replace(/\/$/, "") || "/";
+
+//   // whitelist y như bạn đang dùng
+//   if (pathNorm === "/health") return next();
+//   if (pathNorm.startsWith("/api/lottery/db/")) return next();
+//   if (pathNorm === "/api/lottery/sync-test") return next();
+//   if (pathNorm === "/api/lottery/ping-xoso188") return next();
+//   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
+
+//   if (!db.pool) {
+//     return res.status(503).json({ error: "DB not ready", message: "DATABASE_URL not set or init failed" });
+//   }
+
+//   const key = req.headers["x-gi8-key"];
+//   if (!key) {
+//     return res.status(403).json({ error: "Forbidden", message: "Missing x-gi8-key" });
+//   }
+
+//   try {
+//     const ip =
+//       req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+//       req.socket?.remoteAddress ||
+//       null;
+
+//     const ua = req.headers["user-agent"] || null;
+
+//     // verify key
+//     const { rows } = await db.pool.query(
+//       `SELECT id, client_id, scopes, is_active
+//        FROM auth_accept
+//        WHERE api_key = $1
+//        LIMIT 1`,
+//       [key]
+//     );
+
+//     if (!rows.length) {
+//       return res.status(403).json({ error: "Forbidden", message: "Invalid x-gi8-key" });
+//     }
+//     const auth = rows[0];
+//     if (!auth.is_active) {
+//       return res.status(403).json({ error: "Forbidden", message: "Key is inactive" });
+//     }
+
+//     // update last_used_at (+ lưu ip/ua lần gần nhất nếu bạn muốn)
+//     await db.pool.query(
+//       `UPDATE auth_accept
+//        SET last_used_at = now(),
+//            ip_address = COALESCE($2, ip_address),
+//            user_agent = COALESCE($3, user_agent)
+//        WHERE id = $1`,
+//       [auth.id, ip, ua]
+//     );
+
+//     // attach info để dùng nếu cần
+//     req.gi8 = { auth_id: auth.id, client_id: auth.client_id, scopes: auth.scopes };
+
+//     return next();
+//   } catch (e) {
+//     return res.status(500).json({ error: "Auth error", message: e.message });
+//   }
+// });
+
+
+// // ====================== SERVE FRONTEND (/public) ======================
+// const __filename = fileURLToPath(import.meta.url);
+// const __dirname = path.dirname(__filename);
+// app.use(express.static(path.join(__dirname, "public")));
+
+// // ====================== PROXY: /api/* -> DB hoặc https://xoso188.net/api/* ======================
+// // API đích: GET /api/front/open/lottery/history/list/game?limitNum=200&gameCode=xxx
+// // Trả từ DB với format chuẩn { success, msg, code, t: { turnNum, openTime, serverTime, name, code, sort, navCate, issueList } }
+// const TARGET_BASE = "https://xoso188.net";
+
+// function formatDrawDate(d) {
+//   const day = String(d.getDate()).padStart(2, "0");
+//   const month = String(d.getMonth() + 1).padStart(2, "0");
+//   const year = d.getFullYear();
+//   return { turnNum: `${day}/${month}/${year}`, ymd: `${year}-${month}-${day}` };
+// }
+
+// app.use("/api", async (req, res, next) => {
+//   const match = req.path.match(/^\/front\/open\/lottery\/history\/list\/game/);
+//   if (match && req.method === "GET" && req.query.gameCode && db.pool) {
+//     try {
+//       const data = await db.getLotteryHistoryListGame(
+//         req.query.gameCode,
+//         req.query.limitNum || "200"
+//       );
+//       if (!data) {
+//         return res.status(400).json({
+//           success: false,
+//           msg: "gameCode không tồn tại",
+//           code: 400,
+//         });
+//       }
+//       const now = new Date();
+//       const serverTime =
+//         `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ` +
+//         `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+
+//       const issueList = [];
+//       for (const draw of data.draws) {
+//         const groups = ["", "", "", "", "", "", "", "", ""];
+//         const prizeMap = { DB: 0, G1: 1, G2: 2, G3: 3, G4: 4, G5: 5, G6: 6, G7: 7, G8: 8 };
+//         for (const r of draw.results) {
+//           const idx = prizeMap[r.prize_code];
+//           if (idx !== undefined) {
+//             groups[idx] = groups[idx] ? groups[idx] + "," + r.result_number : r.result_number;
+//           }
+//         }
+//         const { turnNum, ymd } = formatDrawDate(draw.draw_date);
+//         const openTime = `${ymd} ${data.openTimeByRegion}`;
+//         const openTimeStamp = new Date(openTime).getTime();
+//         const openNum = groups[0] || ""; // giải đặc biệt
+//         issueList.push({
+//           turnNum,
+//           openNum,
+//           openTime,
+//           openTimeStamp,
+//           detail: JSON.stringify(groups),
+//           status: 2,
+//           replayUrl: null,
+//           n11: null,
+//           jackpot: 0,
+//         });
+//       }
+
+//       const latestTurn = data.draws.length
+//         ? formatDrawDate(data.draws[0].draw_date)
+//         : { turnNum: "", ymd: "" };
+//       const t = {
+//         turnNum: latestTurn.turnNum,
+//         openTime: data.draws.length
+//           ? `${latestTurn.ymd} ${data.openTimeByRegion}`
+//           : "",
+//         serverTime,
+//         name: data.name,
+//         code: data.code,
+//         sort: data.sort,
+//         navCate: data.navCate,
+//         issueList,
+//       };
+
+//       return res.json({
+//         success: true,
+//         msg: "ok",
+//         code: 0,
+//         t,
+//       });
+//     } catch (e) {
+//       console.warn("DB history/list/game error:", e.message);
+//       return res.status(500).json({
+//         success: false,
+//         msg: e.message || "Lỗi server",
+//         code: 500,
+//       });
+//     }
+//   }
+//   // Proxy to xoso188 (header chuẩn giống Python để không bị chặn)
+//   const targetUrl = TARGET_BASE + req.originalUrl;
+//   try {
+//     const response = await fetch(targetUrl, {
+//       method: req.method,
+//       headers: { ...XOSO188_HEADERS, Accept: req.headers.accept || "application/json" },
+//       timeout: 20000,
+//     });
+//     const body = await response.text();
+//     res.status(response.status);
+//     const ct = response.headers.get("content-type");
+//     if (ct) res.setHeader("content-type", ct);
+//     return res.send(body);
+//   } catch (err) {
+//     return res.status(500).json({ error: "Proxy failed", message: err.message });
+//   }
+// });
+
+// // ====================== HEALTH ======================
+// app.get("/health", (_, res) => res.send("✅ Railway Lottery Proxy Running"));
+
+// // ====================== LOTTERY FETCH (proxy xoso188) ======================
+// // Header chuẩn giống tools/fetch_lottery_and_upload.py để xoso188 không chặn
+// // GET /api/lottery/fetch?gameCode=xxx&limit=200 - Fetch từ xoso188 qua backend
+// app.get("/api/lottery/fetch", async (req, res) => {
+//   const gameCode = req.query.gameCode;
+//   const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 500);
+//   if (!gameCode) {
+//     return res.status(400).json({ error: "Missing gameCode" });
+//   }
+//   const targetUrl = `https://xoso188.net/api/front/open/lottery/history/list/game?limitNum=${limit}&gameCode=${gameCode}`;
+//   try {
+//     const response = await fetch(targetUrl, {
+//       headers: { ...XOSO188_HEADERS, Accept: "application/json" },
+//       timeout: 20000,
+//     });
+//     const body = await response.text();
+//     res.status(response.status);
+//     res.setHeader("content-type", response.headers.get("content-type") || "application/json");
+//     return res.send(body);
+//   } catch (err) {
+//     return res.status(500).json({ error: "Fetch failed", message: err.message });
+//   }
+// });
+
+// // GET /api/lottery/ping-xoso188 - Test Railway có gọi được link phụ xoso188 không (không cần key)
+// app.get("/api/lottery/ping-xoso188", async (req, res) => {
+//   try {
+//     const result = await pingXoso188();
+//     return res.json(result);
+//   } catch (err) {
+//     return res.status(500).json({
+//       ok: false,
+//       status: 0,
+//       message: err?.message || String(err),
+//       count: 0,
+//       source: "xoso188",
+//     });
+//   }
+// });
+
+// // ====================== LOTTERY DB ======================
+// // POST /api/lottery/import - Nhận dữ liệu từ Python script (cần x-gi8-key)
+// app.post("/api/lottery/import", async (req, res) => {
+//   if (!db.pool) {
+//     return res.status(503).json({ error: "DB not configured", message: "DATABASE_URL not set" });
+//   }
+//   try {
+//     const cacheKey = `history:${req.query.gameCode}:${req.query.limitNum || "200"}`;
+//     const cached = cacheGet(cacheKey);
+//     if (cached) return res.json(cached);
+//     const { draws } = req.body;
+//     if (!Array.isArray(draws) || draws.length === 0) {
+//       return res.status(400).json({ error: "Invalid payload", message: "draws array required" });
+//     }
+//     const result = await db.importLotteryResults(req.body);
+//     const payload = {
+//       success: true,
+//       msg: "ok",
+//       code: 0,
+//       t,
+//     };
+    
+//     cacheSet(cacheKey, payload, 60_000);
+//     return res.json(payload);
+//     return res.json({ ok: true, ...result });
+//   } catch (err) {
+//     console.error("Import error:", err);
+//     return res.status(500).json({ error: "Import failed", message: err.message });
+//   }
+// });
+
+// // GET /api/lottery/sync-test?region=mn|mt|mb - Test link phụ xoso188 (không cần key)
+// app.get("/api/lottery/sync-test", async (req, res) => {
+//   try {
+//     const { runSyncTest } = await import("./db/lotterySync.js");
+//     const region = (req.query.region || "").toLowerCase();
+//     const result = await runSyncTest(region);
+//     return res.json(result);
+//   } catch (err) {
+//     return res.status(500).json({ ok: false, error: err.message || String(err) });
+//   }
+// });
+
+// // GET /api/lottery/trigger-sync?region=mn|mt|mb - Gọi sync theo lịch (cần x-gi8-key).
+// // Dùng khi cron trong process không chạy (Railway sleep): cron ngoài gọi đúng giờ 16:13 / 17:13 / 18:13 VN.
+// app.get("/api/lottery/trigger-sync", (req, res) => {
+//   if (!db.pool) {
+//     return res.status(503).json({ success: false, msg: "DB chưa sẵn sàng", code: 503 });
+//   }
+//   const region = (req.query.region || "").toLowerCase();
+//   if (region !== "mn" && region !== "mt" && region !== "mb") {
+//     return res.status(400).json({ success: false, msg: "region phải là mn | mt | mb", code: 400 });
+//   }
+//   triggerRegionSync(region, db.pool, db.importLotteryResults);
+//   const label = { mn: "Miền Nam (16:15)", mt: "Miền Trung (17:15)", mb: "Miền Bắc (18:15)" }[region];
+//   return res.status(202).json({
+//     success: true,
+//     msg: `Đã kích hoạt sync ${label}. Poll 5s đến khi có kết quả rồi lưu DB.`,
+//     code: 0,
+//     region,
+//   });
+// });
+
+// // GET /api/lottery/db/draws?date=DD/MM/YYYY&region=MB|MT|MN - Lấy kết quả theo ngày
+// app.get("/api/lottery/db/draws", async (req, res) => {
+//   if (!db.pool) {
+//     return res.status(503).json({ error: "DB not configured" });
+//   }
+//   try {
+//     const dateStr = req.query.date;
+//     const region = req.query.region || null;
+//     if (!dateStr) {
+//       return res.status(400).json({ error: "Missing date (DD/MM/YYYY)" });
+//     }
+//     const [d, m, y] = dateStr.split(/[\/\-]/).map(Number);
+//     const drawDate = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+//     const draws = await db.getDrawsByDate(drawDate, region);
+//     const withResults = await Promise.all(
+//       draws.map(async (d) => {
+//         const results = await db.getResultsByDrawId(d.id);
+//         return { ...d, results };
+//       })
+//     );
+//     return res.json({ draws: withResults });
+//   } catch (err) {
+//     console.error("Get draws error:", err);
+//     return res.status(500).json({ error: err.message });
+//   }
+// });
+
+// // GET /api/lottery/db/history/:gameCode?limit=200 - Format giống xoso188 cho frontend
+// app.get("/api/lottery/db/history/:gameCode", async (req, res) => {
+//   if (!db.pool) {
+//     return res.status(503).json({ error: "DB not configured" });
+//   }
+//   try {
+//     const gameCode = req.params.gameCode;
+//     const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 500);
+//     const { rows } = await db.pool.query(
+//       `SELECT d.draw_date, d.id as draw_id, p.api_game_code, p.code as province_code, r.code as region_code
+//        FROM lottery_draws d
+//        JOIN lottery_provinces p ON d.province_id = p.id
+//        JOIN regions r ON d.region_id = r.id
+//        WHERE p.api_game_code = $1
+//        ORDER BY d.draw_date DESC
+//        LIMIT $2`,
+//       [gameCode, limit]
+//     );
+//     const issueList = [];
+//     for (const row of rows) {
+//       const resRows = await db.getResultsByDrawId(row.draw_id);
+//       const groups = ["", "", "", "", "", "", "", "", ""];
+//       const prizeMap = { DB: 0, G1: 1, G2: 2, G3: 3, G4: 4, G5: 5, G6: 6, G7: 7, G8: 8 };
+//       for (const r of resRows) {
+//         const idx = prizeMap[r.prize_code];
+//         if (idx !== undefined) {
+//           if (groups[idx]) groups[idx] += "," + r.result_number;
+//           else groups[idx] = r.result_number;
+//         }
+//       }
+//       const turnNum = row.draw_date.toISOString().slice(0, 10).split("-").reverse().join("/");
+//       issueList.push({ turnNum, detail: JSON.stringify(groups) });
+//     }
+//     return res.json({ t: { issueList } });
+//   } catch (err) {
+//     console.error("History error:", err);
+//     return res.status(500).json({ error: err.message });
+//   }
+// });
+
+// // ====================== START ======================
+// // Server listen ngay để Railway không timeout (502); DB init chạy sau
+// const PORT = process.env.PORT || 3000;
+// app.listen(PORT, () => {
+//   console.log("🚀 Server chạy port", PORT);
+//   db
+//     .initDb()
+//     .then(async (pool) => {
+//       if (pool) {
+//         db.scheduleLotterySync(pool, db.importLotteryResults);
+//         console.log("[Startup] LotterySync: cron nội bộ đã đăng ký. Nếu Railway sleep lúc 16:13/17:13/18:13 VN, hãy dùng cron ngoài gọi GET /api/lottery/trigger-sync?region=mn|mt|mb với header x-gi8-key.");
+//       } else {
+//         console.warn("[Startup] DB init trả null → không chạy scheduleLotterySync. Kiểm tra DATABASE_URL và log lỗi phía trên.");
+//       }
+//       const ping = await pingXoso188();
+//       console.log("[Startup] xoso188:", ping.ok ? "OK (count=" + ping.count + ")" : "FAIL", ping.message || "");
+//     })
+//     .catch((e) => console.warn("DB init:", e.message));
+// });
