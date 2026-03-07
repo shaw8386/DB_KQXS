@@ -67,6 +67,24 @@ CREATE TABLE IF NOT EXISTS auth_accept (
 
 CREATE INDEX IF NOT EXISTS idx_auth_accept_active ON auth_accept(is_active);
 CREATE INDEX IF NOT EXISTS idx_auth_accept_client ON auth_accept(client_id);
+
+-- Bảng Xổ Số Trực Tiếp: lưu từng giải khi có kết quả (poll 10s trong giờ xổ)
+CREATE TABLE IF NOT EXISTS kq_tructiep (
+  id SERIAL PRIMARY KEY,
+  draw_date DATE NOT NULL,
+  region_code VARCHAR(10) NOT NULL,
+  province_code VARCHAR(20) NOT NULL,
+  province_name VARCHAR(100),
+  prize_code VARCHAR(10) NOT NULL,
+  prize_order INTEGER NOT NULL DEFAULT 1,
+  result_number VARCHAR(20) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(draw_date, region_code, province_code, prize_code, prize_order)
+);
+CREATE INDEX IF NOT EXISTS idx_kq_tructiep_draw ON kq_tructiep(draw_date);
+CREATE INDEX IF NOT EXISTS idx_kq_tructiep_region ON kq_tructiep(region_code);
+CREATE INDEX IF NOT EXISTS idx_kq_tructiep_province ON kq_tructiep(province_code);
+CREATE INDEX IF NOT EXISTS idx_kq_tructiep_created ON kq_tructiep(created_at DESC);
 `;
 
 const PROVINCES_SEED_SQL = `
@@ -107,6 +125,62 @@ export async function initDb() {
     console.error("❌ DB init error:", err.message);
     return null;
   }
+}
+
+/**
+ * Lưu từng giải vào KQ_tructiep (Xổ Số Trực Tiếp).
+ * @param {Array<{ draw_date, region_code, province_code, province_name?, prize_code, prize_order, result_number }>} items
+ * @returns {Promise<{ saved: number, skipped: number }>}
+ */
+export async function importLiveResults(items) {
+  if (!pool || !Array.isArray(items) || items.length === 0) {
+    return { saved: 0, skipped: 0 };
+  }
+  let saved = 0;
+  let skipped = 0;
+  const client = await pool.connect();
+  try {
+    for (const it of items) {
+      const { draw_date, region_code, province_code, province_name, prize_code, prize_order = 1, result_number } = it;
+      if (!draw_date || !region_code || !province_code || !prize_code || result_number == null) {
+        skipped++;
+        continue;
+      }
+      try {
+        await client.query(
+          `INSERT INTO kq_tructiep (draw_date, region_code, province_code, province_name, prize_code, prize_order, result_number)
+           VALUES ($1::date, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (draw_date, region_code, province_code, prize_code, prize_order) DO UPDATE SET
+             result_number = EXCLUDED.result_number,
+             province_name = COALESCE(EXCLUDED.province_name, kq_tructiep.province_name)`,
+          [draw_date, region_code, province_code, province_name || null, prize_code, prize_order, String(result_number)]
+        );
+        saved++;
+      } catch (e) {
+        skipped++;
+      }
+    }
+    return { saved, skipped };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Lấy kết quả trực tiếp theo ngày + miền (optional).
+ */
+export async function getLiveResults(drawDate, regionCode = null) {
+  if (!pool) return [];
+  let query = `SELECT draw_date, region_code, province_code, province_name, prize_code, prize_order, result_number, created_at
+               FROM kq_tructiep WHERE draw_date = $1::date`;
+  const params = [drawDate];
+  if (regionCode) {
+    query += " AND region_code = $2";
+    params.push(regionCode);
+  }
+  query += " ORDER BY region_code, province_code, prize_code, prize_order";
+  const { rows } = await pool.query(query, params);
+  return rows;
 }
 
 export async function importLotteryResults(payload) {
