@@ -40,9 +40,9 @@ app.use(async (req, res, next) => {
   if (pathNorm === "/api/lottery/sync-test") return next();
   if (pathNorm === "/api/lottery/ping-xoso188") return next();
 
-  // Import (POST) vẫn yêu cầu key? => Nếu bạn muốn import cũng cần key thì BỎ whitelist này.
-  // Hiện tại giữ đúng như code cũ của bạn: import được whitelist qua guard.
+  // Import (POST) và push-kqxs (Genlogin) – whitelist (không cần x-gi8-key)
   if (pathNorm === "/api/lottery/import" && req.method === "POST") return next();
+  if (pathNorm === "/api/lottery/push-kqxs" && req.method === "POST") return next();
 
   // ===== REQUIRE DB =====
   if (!db.pool) {
@@ -277,6 +277,46 @@ app.get("/api/lottery/ping-xoso188", async (req, res) => {
 });
 
 // ====================== LOTTERY DB ======================
+// POST /api/lottery/push-kqxs – Nhận kqxs_data từ Genlogin, convert và ghi DB
+app.post("/api/lottery/push-kqxs", async (req, res) => {
+  if (!db.pool) {
+    return res.status(503).json({ error: "DB not configured", message: "DATABASE_URL not set" });
+  }
+  try {
+    const { kqxs_data, region } = req.body;
+    if (!kqxs_data || typeof kqxs_data !== "object") {
+      return res.status(400).json({
+        error: "Invalid payload",
+        message: "kqxs_data (object) required. VD: { run, tinh, ntime, kq: { 13: {...}, 14: {...} } }",
+      });
+    }
+
+    const { kqxsDataToDraws } = await import("./utils/minhNgocToXoso188.js");
+    const regionKey = (region || "mn").toLowerCase();
+    if (regionKey !== "mn" && regionKey !== "mt" && regionKey !== "mb") {
+      return res.status(400).json({ error: "Invalid region", message: "region phải là mn | mt | mb" });
+    }
+
+    const draws = kqxsDataToDraws(kqxs_data, regionKey);
+    if (draws.length === 0) {
+      return res.json({
+        ok: true,
+        imported: 0,
+        skipped: 0,
+        message: "Không có dữ liệu hợp lệ để ghi (kq rỗng hoặc chưa có số)",
+      });
+    }
+
+    const result = await db.importLotteryResults({ draws });
+    memCache.clear();
+
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("push-kqxs error:", err);
+    return res.status(500).json({ error: "Push failed", message: err.message });
+  }
+});
+
 // POST /api/lottery/import
 app.post("/api/lottery/import", async (req, res) => {
   if (!db.pool) {
