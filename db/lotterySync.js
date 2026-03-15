@@ -10,7 +10,7 @@
  *   Nếu lỗi/không lấy được khi kết thúc giờ xổ → fallback xoso188.
  *
  * Case 2 – Xổ Số Trực Tiếp (kq_tructiep):
- *   Trong giờ xổ mỗi miền → call mỗi 10s lấy Minh Ngọc.
+ *   Trong giờ xổ mỗi miền → call mỗi 5s lấy Minh Ngọc.
  *   Cứ có giải nào → lưu ngay vào kq_tructiep (từng giải, ngày, đài, miền...).
  *
  * 3) 20h cuối ngày: kiểm tra lottery_draws, backfill từ xoso188 nếu thiếu.
@@ -58,8 +58,8 @@ const REGION_SCHEDULE = {
   },
 };
 
-// Case 2 – Xổ Số Trực Tiếp: poll 10s trong giờ xổ
-const LIVE_POLL_INTERVAL_MS = 10 * 1000;
+// Case 2 – Xổ Số Trực Tiếp: poll 5s trong giờ xổ (khớp frontend gi8 poll 5s)
+const LIVE_POLL_INTERVAL_MS = 5 * 1000;
 
 // Header khớp tools/fetch_lottery_and_upload.py BROWSER_HEADERS (từ DevTools xoso188 - Edge)
 const XOSO188_HEADERS = {
@@ -438,7 +438,7 @@ function drawsToLiveItems(draws, provinceNames = {}) {
 }
 
 /**
- * Case 2 – Xổ Số Trực Tiếp: poll 10s trong giờ xổ, lưu từng giải vào kq_tructiep.
+ * Case 2 – Xổ Số Trực Tiếp: poll 5s trong giờ xổ, lưu từng giải vào kq_tructiep.
  */
 async function pollLiveUntilEnd(region, pool, importLiveResults) {
   if (livePollIntervals[region]) return;
@@ -468,7 +468,7 @@ async function pollLiveUntilEnd(region, pool, importLiveResults) {
     }
   };
 
-  console.log(`[XSTT] ${label}: bắt đầu poll trực tiếp mỗi 10s (${today})`);
+  console.log(`[XSTT] ${label}: bắt đầu poll trực tiếp mỗi 5s (${today})`);
   await tick();
   livePollIntervals[region] = setInterval(tick, LIVE_POLL_INTERVAL_MS);
 }
@@ -661,7 +661,7 @@ export function triggerRegionSync(region, pool, importLotteryResults, importLive
 /**
  * Đăng ký cron nội bộ.
  * Case 1: MN 16:15, MT 17:15, MB 18:15 – poll 5 phút Minh Ngọc → fallback xoso188 → lưu lottery_draws.
- * Case 2: Trong giờ xổ – poll 10s Minh Ngọc → lưu từng giải vào kq_tructiep (Xổ Số Trực Tiếp).
+ * Case 2: Trong giờ xổ – poll 5s Minh Ngọc → lưu từng giải vào kq_tructiep (Xổ Số Trực Tiếp).
  * @param {object} pool - pg.Pool
  * @param {Function} importLotteryResults - (payload) => Promise<{ imported, skipped }>
  * @param {Function} [importLiveResults] - (items) => Promise<{ saved, skipped }> – cho Case 2
@@ -695,5 +695,5 @@ export function scheduleLotterySync(pool, importLotteryResults, importLiveResult
   }, { timezone: tz });
   // Chạy ngay khi deploy/startup (kiểm tra & backfill nếu thiếu data hôm nay)
   checkAndBackfillToday(pool, importLotteryResults);
-  console.log("[LotterySync] Đã lên lịch: MN/MT/MB 16:15/17:15/18:15 (poll 5 phút); XSTT poll 10s; 20h backfill.");
+  console.log("[LotterySync] Đã lên lịch: MN/MT/MB 16:15/17:15/18:15 (poll 5 phút); XSTT poll 5s; 20h backfill.");
 }
