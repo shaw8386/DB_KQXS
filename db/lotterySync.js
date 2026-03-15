@@ -18,6 +18,8 @@
 
 import fetch from "node-fetch";
 import cron from "node-cron";
+import { fetchMinhNgocKqxsData } from "../Get_DataXS_tructiep.js";
+import { kqxsDataToDraws } from "../utils/minhNgocToXoso188.js";
 
 // ---------- API server tự cron gọi (không dùng cho web gi8 / client) ----------
 const MINH_NGOC_BASE = "https://dc.minhngoc.net/O0O/0/xstt";
@@ -303,87 +305,14 @@ function issuesToDraws(gameCode, issues, filterDrawDate) {
   return draws;
 }
 
-// ---------- API chính: Minh Ngọc (MINH_NGOC_BASE) – kết quả trực tiếp ngày hôm đó ----------
-// Server cron gọi trước; nếu không có kết quả thì mới dùng xoso188.
-// Response mẫu: kqxs.mn={run:0,tinh:"1,19,21,20",ntime:...,delay:5000} — hiện chỉ metadata, chưa có số giải → trả null → fallback xoso188.
+// ---------- API chính: Minh Ngọc – dùng logic từ Get_DataXS_tructiep.js (fetch + parse), convert → draws ----------
+// Server cron gọi đúng giờ; nếu không có kết quả thì fallback xoso188.
 async function fetchMinhNgoc(region) {
-  const urls = {
-    mn: `${MINH_NGOC_BASE}/js_m1.js`,
-    mt: `${MINH_NGOC_BASE}/js_m3.js`,
-    mb: `${MINH_NGOC_BASE}/js_m2.js`,
-  };
-  const url = `${urls[region]}?_=${Date.now()}`;
   try {
-    const res = await fetch(url, {
-      headers: { Accept: "*/*", "User-Agent": "Mozilla/5.0 (compatible; LotterySync/1.0)" },
-      timeout: 15000,
-    });
-    const text = await res.text();
-
-    // 1) Tách object kqxs.mn / kqxs.mt / kqxs.mb = {...};
-    const match = text.match(/kqxs\.(mn|mb|mt)\s*=\s*(\{[\s\S]*?\});?/);
-    if (!match) return null;
-    let objStr = match[2];
-
-    // 2) Chuẩn hóa JS object -> JSON: key: -> "key":
-    objStr = objStr.replace(/(\w+)\s*:/g, '"$1":');
-
-    let data;
-    try {
-      data = JSON.parse(objStr);
-    } catch {
-      console.warn("[Minh Ngọc]", region, "JSON.parse lỗi");
-      return null;
-    }
-
-    // 3) Giả định Minh Ngọc có mảng data.kq (hoặc data.issues) chứa các kỳ quay
-    const rawIssues = Array.isArray(data.kq || data.issues) ? (data.kq || data.issues) : [];
-    if (rawIssues.length === 0) return [];
-
-    const draws = [];
-
-    for (const issue of rawIssues) {
-      // Ngày quay: ưu tiên issue.date, fallback issue.turnNum
-      const drawDate = parseVNDateToYMD(issue.date || issue.turnNum);
-      if (!drawDate) continue;
-
-      // Mã station: tùy Minh Ngọc trả gì (station, code, stationCode, ...)
-      const stationKey = String(
-        issue.station || issue.stationCode || issue.code || ""
-      ).toLowerCase();
-
-      const map = MINH_NGOC_STATION_TO_REGION_PROVINCE[stationKey];
-
-      let regionCode;
-      let provinceCode;
-
-      if (map) {
-        [regionCode, provinceCode] = map;
-      } else if (region === "mb") {
-        // Miền Bắc: nếu không có station rõ, xử lý giống xoso188: suy ra tỉnh từ ngày
-        regionCode = "MB";
-        const dmy = drawDate.split("-").reverse().join("/"); // YYYY-MM-DD -> DD/MM/YYYY
-        const stationName = getStationNameMB(dmy);
-        provinceCode = MB_NAME_TO_CODE[stationName] || "HN";
-      } else {
-        // Không map được station -> bỏ qua để tránh ghi sai DB
-        continue;
-      }
-
-      // Giả định Minh Ngọc có field detail giống xoso188 (mảng JSON DB..G8)
-      const detailStr = issue.detail || issue.kq_detail || "";
-      const results = parseDetail(detailStr);
-      if (!results.length) continue;
-
-      draws.push({
-        draw_date: drawDate,       // "YYYY-MM-DD"
-        province_code: provinceCode,
-        region_code: regionCode,   // "MN" | "MT" | "MB"
-        results,
-      });
-    }
-
-    return draws;
+    const kqxs_data = await fetchMinhNgocKqxsData(region);
+    if (!kqxs_data || typeof kqxs_data.kq !== "object") return null;
+    const draws = kqxsDataToDraws(kqxs_data, region);
+    return draws || [];
   } catch (err) {
     console.warn("[Minh Ngọc]", region, err.message);
     return null;
