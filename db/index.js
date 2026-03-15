@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS auth_accept (
 CREATE INDEX IF NOT EXISTS idx_auth_accept_active ON auth_accept(is_active);
 CREATE INDEX IF NOT EXISTS idx_auth_accept_client ON auth_accept(client_id);
 
--- Bảng Xổ Số Trực Tiếp: lưu từng giải khi có kết quả (poll 10s trong giờ xổ)
+-- Bảng Xổ Số Trực Tiếp: lưu từng giải khi có kết quả (poll 5s trong giờ xổ)
 CREATE TABLE IF NOT EXISTS kq_tructiep (
   id SERIAL PRIMARY KEY,
   draw_date DATE NOT NULL,
